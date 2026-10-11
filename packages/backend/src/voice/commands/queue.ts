@@ -1,12 +1,18 @@
 import type { VoiceBot } from '../voice-bot.js';
 import type { QueueItem } from '../playlist/queue.js';
 import { defaultMediaUrlDeps, runMediaUrlPipeline } from '../media-url-pipeline.js';
+import { musicHistoryErrorCode, recordMusicRequests } from '../music-request-history.js';
 import { formatQueueMessage } from '../ts6-chat-format.js';
 import type { CommandContext } from './context.js';
 /** Cancels stale background playlist expansions for chat !play / !queue. */
 const chatPlaylistGeneration = new Map<number, number>();
 /** Abort pending song searches when the bot's media request is replaced or stopped. */
 const chatMediaControllers = new Map<number, AbortController>();
+
+/** Observe pending media intent without cancelling it. */
+export function getChatMediaGeneration(botId: number): number {
+  return chatPlaylistGeneration.get(botId) ?? 0;
+}
 
 /** One cancellation identity spans song search, channel movement, and queue insertion. */
 export interface ChatMediaRequest {
@@ -30,6 +36,28 @@ export function invalidateChatPlaylistExpansion(botId: number): void {
   chatPlaylistGeneration.set(botId, (chatPlaylistGeneration.get(botId) ?? 0) + 1);
 }
 
+/** Append a resolved request, starting it only when music is idle. */
+export async function enqueueMediaItem(context: CommandContext, bot: VoiceBot, item: QueueItem, isCurrent: () => boolean): Promise<boolean | null> {
+  if (!['connected', 'playing', 'paused'].includes(bot.status)) throw new Error('Bot is not connected');
+  const queued = bot.status === 'playing' || bot.status === 'paused';
+  const options = queued ? undefined : context.chatMusicSwitch(bot);
+  if (options) bot.assertMusicCanStart(options.replaceSessionIds);
+  if (!queued) {
+    const cleanup = bot.queue.addForPlayback(item);
+    let started = false;
+    try {
+      if (item.streamUrl) await bot.playStream(item, options);
+      else await bot.play(item, options);
+      started = isCurrent() && bot.nowPlaying === item;
+    } finally {
+      if (!started) cleanup();
+    }
+    if (!started) return null;
+  } else bot.queue.add(item);
+  context.saveMusicRequest(bot, item);
+  return queued;
+}
+
 /**
  * Resolve Spotify / Apple Music / YouTube Music / playlist URLs, download the first track,
  * and queue the rest in the background (same approach as play-url).
@@ -42,11 +70,18 @@ export async function enqueueMediaUrl(
   rawUrl: string,
   request = beginChatMediaRequest(botId),
 ): Promise<void> {
-  if (request.isCancelled()) return;
+  const serverConfigId = bot.currentConfig.serverConfigId;
+  const virtualServerId = context.virtualServerIdForBot(botId);
+  const isCurrent = () => !request.isCancelled()
+    && context.voiceBotManager.getBot(botId) === bot
+    && bot.currentConfig.serverConfigId === serverConfigId
+    && context.virtualServerIdForBot(botId) === virtualServerId;
+  if (!isCurrent()) return;
   await context.joinChannelForCommand(botId, bot, userClid);
-  if (request.isCancelled()) return;
+  if (!isCurrent()) return;
   let firstCall = true;
   let alreadyPlaying = false;
+  let playbackAccepted = true;
 
   const result = await runMediaUrlPipeline(
     defaultMediaUrlDeps(),
@@ -55,22 +90,22 @@ export async function enqueueMediaUrl(
         const isFirst = firstCall;
         firstCall = false;
         const live = context.voiceBotManager.getBot(botId);
-        if (!live || request.isCancelled()) return;
-        if (isFirst) alreadyPlaying = live.status === 'playing' || live.status === 'paused';
-        live.queue.add(item);
-        context.saveMusicRequest(live, item);
-        if (isFirst && alreadyPlaying) return;
-        live.queue.playAt(live.queue.length - 1);
+        if (!live || !isCurrent()) return;
         if (isFirst) {
-          await live.play(item, context.chatMusicSwitch(live));
+          const queued = await enqueueMediaItem(context, live, item, isCurrent);
+          playbackAccepted = queued !== null;
+          alreadyPlaying = queued ?? false;
         } else {
+          live.queue.add(item);
+          context.saveMusicRequest(live, item);
+          live.queue.playAt(live.queue.length - 1);
           await live.play(item).catch((err) => {
             console.error('[MusicCmd] Failed to resume playlist playback:', err);
           });
         }
       },
       enqueue: (item) => {
-        if (request.isCancelled()) return;
+        if (!isCurrent() || !playbackAccepted) return;
         const live = context.voiceBotManager.getBot(botId);
         if (!live || live.status === 'stopped' || live.status === 'error') return;
         live.queue.add(item);
@@ -78,9 +113,9 @@ export async function enqueueMediaUrl(
       },
       isIdle: () => {
         const live = context.voiceBotManager.getBot(botId);
-        return Boolean(live && live.status === 'connected' && !live.nowPlaying);
+        return Boolean(isCurrent() && live?.status === 'connected' && !live.nowPlaying);
       },
-      isCancelled: request.isCancelled,
+      isCancelled: () => !isCurrent() || !playbackAccepted,
     },
     { url: rawUrl, enqueueOnly: false },
     {
@@ -90,7 +125,7 @@ export async function enqueueMediaUrl(
     },
   );
 
-  if (request.isCancelled()) return;
+  if (!isCurrent() || !playbackAccepted) return;
 
   const pendingTotal = result.queuedInBackground;
   const playlistNote =
@@ -150,6 +185,7 @@ export async function handlePlaylist(
     source: song.source as QueueItem['source'], sourceUrl: song.sourceUrl ?? undefined,
   }));
   bot.queue.addMany(items);
+  context.saveMusicRequest(bot, items);
   if (bot.status === 'connected' && !bot.nowPlaying) {
     const first = bot.queue.playAt(bot.queue.index < 0 ? 0 : bot.queue.index + 1);
     if (first) await bot.play(first, context.chatMusicSwitch(bot)); // VoiceBot owns local/stream playlist resolution.
@@ -289,27 +325,14 @@ export function handleShuffle(context: CommandContext, bot: VoiceBot, userClid: 
   context.reply(bot, userClid, enabled ? 'Shuffle on.' : 'Shuffle off.');
 }
 
-/** Record a source URL in server-scoped request history without blocking playback. */
-export function saveMusicRequest(context: CommandContext, bot: VoiceBot, item: QueueItem): void {
-  if (!item.sourceUrl || !bot.currentConfig.serverConfigId) return;
-  context.prisma.musicRequest.upsert({
-    where: {
-      serverConfigId_url: {
-        serverConfigId: bot.currentConfig.serverConfigId,
-        url: item.sourceUrl,
-      },
-    },
-    update: {
-      requestedAt: new Date(),
-      title: item.title || 'Unknown Title',
-    },
-    create: {
-      serverConfigId: bot.currentConfig.serverConfigId,
-      url: item.sourceUrl,
-      title: item.title || 'Unknown Title',
-      requestedAt: new Date(),
-    },
-  }).catch((err) => {
-    console.error('[MusicCmd] Failed to save music request history:', err.message);
+/** Record a canonical source reference in per-bot request history without blocking playback. */
+export function saveMusicRequest(context: CommandContext, bot: VoiceBot, item: QueueItem | QueueItem[]): void {
+  const serverConfigId = bot.currentConfig.serverConfigId;
+  if (!serverConfigId) return;
+  void recordMusicRequests(context.prisma, {
+    serverConfigId,
+    musicBotId: bot.currentConfig.id,
+  }, Array.isArray(item) ? item : [item]).catch(error => {
+    console.error('[MusicCmd] Failed to save music request history (%s)', musicHistoryErrorCode(error));
   });
 }

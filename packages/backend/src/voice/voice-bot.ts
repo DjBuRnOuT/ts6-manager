@@ -885,6 +885,7 @@ export class VoiceBot extends EventEmitter {
 
   /** Returns sessions actually replaced (this bot's video) when starting music. */
   async play(item: QueueItem, options: MusicStartOptions = {}): Promise<MediaSessionInfo[]> {
+    if (item.streamUrl) return this.playStream(item, options);
     if (this._status !== 'connected' && this._status !== 'playing' && this._status !== 'paused') {
       throw new Error('Bot is not connected');
     }
@@ -1320,8 +1321,11 @@ export class VoiceBot extends EventEmitter {
       this.playbackTimer = setTimeout(tick, 200);
       this.startAutoStopTimer();
     } catch (err) {
-      if (!current()) return replaced;
       // A failed start must not leave ICY polling running for a dead stream.
+      if (!current()) {
+        console.warn('[VoiceBot %s] Discarding failed stale stream startup', this.config.id);
+        return replaced;
+      }
       this.stopIcyPolling();
       this._isStreaming = false;
       this.streamKill = null;

@@ -14,6 +14,7 @@ import { parseReplaceSessionIds } from '../voice/media-session.js';
 import { runMediaAudited } from './media-audit.js';
 import { createVideoQueueRoutes } from './video-queue.routes.js';
 import { defaultMediaUrlDeps, runMediaUrlPipeline, type MediaUrlPipelineDeps } from '../voice/media-url-pipeline.js';
+import { musicHistoryErrorCode, recordMusicRequests } from '../voice/music-request-history.js';
 import {
   invalidatePlaylistExpansion,
   playlistExpansionGeneration,
@@ -82,6 +83,16 @@ async function applyAndSaveVolume(prisma: any, bot: VoiceBot | undefined, id: nu
     if (!bot || bot.currentConfig.volume === vol) {
       await saveBotVolume(prisma, id, vol);
     }
+  }
+}
+
+async function saveRequestHistory(req: Request, bot: VoiceBot, item: QueueItem | QueueItem[]): Promise<void> {
+  const serverConfigId = bot.currentConfig.serverConfigId;
+  if (!serverConfigId) return;
+  try {
+    await recordMusicRequests(req.app.locals.prisma, { serverConfigId, musicBotId: bot.currentConfig.id }, Array.isArray(item) ? item : [item]);
+  } catch (error) {
+    console.error('[music-bots.routes] Failed to save music request history (%s)', musicHistoryErrorCode(error));
   }
 }
 
@@ -271,30 +282,32 @@ musicBotRoutes.get('/:id', async (req: Request, res: Response, next) => {
 musicBotRoutes.put('/:id/automation', async (req, res, next) => {
   try {
     const settings = parseAutomationSettings(req.body);
-    const existing = await avatarBot(req);
-    const prisma = req.app.locals.prisma;
-    if (settings.source?.kind === 'playlist') {
-      const playlist = await prisma.playlist.findUnique({
-        where: { id: settings.source.id }, include: { musicBot: { select: { serverConfigId: true } } },
+    // Serialize validation too, so a slow source lookup cannot reorder overlapping edits.
+    await serializeBotSettings(Number(req.params.id), async () => {
+      const existing = await avatarBot(req);
+      const prisma = req.app.locals.prisma;
+      if (settings.source?.kind === 'playlist') {
+        const playlist = await prisma.playlist.findUnique({
+          where: { id: settings.source.id }, include: { musicBot: { select: { serverConfigId: true } } },
+        });
+        if (!playlist || (playlist.serverConfigId != null && playlist.serverConfigId !== existing.serverConfigId) ||
+            (playlist.musicBot && playlist.musicBot.serverConfigId !== existing.serverConfigId)) {
+          throw new AppError(400, 'Choose a playlist shared with this bot’s server');
+        }
+      } else if (settings.source?.kind === 'radio') {
+        const station = await prisma.radioStation.findUnique({ where: { id: settings.source.id } });
+        if (!station || station.serverConfigId !== existing.serverConfigId) {
+          throw new AppError(400, 'Choose a radio station from this bot’s server');
+        }
+      }
+      await runRemoteAudited(prisma, {
+        actor: actorFromRequest(req.user), action: 'music_bot.automation_update', connectionId: existing.serverConfigId,
+        target: { type: 'music_bot', id: existing.id },
+      }, async () => {
+        await prisma.musicBot.update({ where: { id: existing.id }, data: { automationSettings: JSON.stringify(settings) } });
+        await req.app.locals.voiceBotManager.getBot(existing.id)?.automation.configure(settings);
       });
-      if (!playlist || (playlist.serverConfigId != null && playlist.serverConfigId !== existing.serverConfigId) ||
-          (playlist.musicBot && playlist.musicBot.serverConfigId !== existing.serverConfigId)) {
-        throw new AppError(400, 'Choose a playlist shared with this bot’s server');
-      }
-    } else if (settings.source?.kind === 'radio') {
-      const station = await prisma.radioStation.findUnique({ where: { id: settings.source.id } });
-      if (!station || station.serverConfigId !== existing.serverConfigId) {
-        throw new AppError(400, 'Choose a radio station from this bot’s server');
-      }
-    }
-    // Serialize saves and runtime application so overlapping edits keep the newest settings.
-    await serializeBotSettings(existing.id, () => runRemoteAudited(prisma, {
-      actor: actorFromRequest(req.user), action: 'music_bot.automation_update', connectionId: existing.serverConfigId,
-      target: { type: 'music_bot', id: existing.id },
-    }, async () => {
-      await prisma.musicBot.update({ where: { id: existing.id }, data: { automationSettings: JSON.stringify(settings) } });
-      await req.app.locals.voiceBotManager.getBot(existing.id)?.automation.configure(settings);
-    }));
+    });
     res.json(settings);
   } catch (error) { next(error); }
 });
@@ -482,9 +495,16 @@ musicBotRoutes.post('/:id/play', async (req: Request, res: Response, next) => {
     await runMediaAudited(req, bot, 'media.music.start', async () => {
       if (playlistExpansionGeneration(id) !== generation) return [];
       // Select and start together after the audit wait, before queue notifications advance.
-      bot.queue.add(queueItem);
-      bot.queue.playAt(bot.queue.length - 1);
-      return bot.play(queueItem, { replaceSessionIds });
+      const cleanup = bot.queue.addForPlayback(queueItem);
+      let started = false;
+      try {
+        const replaced = await bot.play(queueItem, { replaceSessionIds });
+        started = bot.nowPlaying === queueItem;
+        if (started) await saveRequestHistory(req, bot, queueItem);
+        return replaced;
+      } finally {
+        if (!started) cleanup();
+      }
     }, replaceSessionIds);
 
     res.json({ success: true });
@@ -510,34 +530,11 @@ export function createPlayUrlHandler(deps: MediaUrlPipelineDeps = defaultMediaUr
       throw new AppError(400, 'Bot is not connected');
     }
 
-    const saveHistory = async (sourceUrl: string, title: string) => {
-      try {
-        const prisma = req.app.locals.prisma;
-        if (!bot.currentConfig.serverConfigId) return;
-        await prisma.musicRequest.upsert({
-          where: {
-            serverConfigId_url: {
-              serverConfigId: bot.currentConfig.serverConfigId,
-              url: sourceUrl,
-            },
-          },
-          update: {
-            requestedAt: new Date(),
-            title: title || 'Unknown Title',
-          },
-          create: {
-            serverConfigId: bot.currentConfig.serverConfigId,
-            url: sourceUrl,
-            title: title || 'Unknown Title',
-            requestedAt: new Date(),
-          },
-        });
-      } catch (saveErr) {
-        console.error('[music-bots.routes] Failed to save music request history:', saveErr);
-      }
-    };
-
     const generation = invalidatePlaylistExpansion(id);
+    const serverConfigId = bot.currentConfig.serverConfigId;
+    const serverPort = bot.currentConfig.serverPort;
+    const isCurrent = () => playlistExpansionGeneration(id) === generation && manager.getBot(id) === bot
+      && bot.currentConfig.serverConfigId === serverConfigId && bot.currentConfig.serverPort === serverPort;
 
     let firstCall = true;
     let pipelineResult: Awaited<ReturnType<typeof runMediaUrlPipeline>>;
@@ -549,7 +546,7 @@ export function createPlayUrlHandler(deps: MediaUrlPipelineDeps = defaultMediaUr
             const isFirst = firstCall;
             firstCall = false;
             const live = manager.getBot(id);
-            if (!live || playlistExpansionGeneration(id) !== generation) return;
+            if (!live || !isCurrent()) return;
             const shouldStart = isFirst || !enqueueOnly;
             // Audited start: mutate queue only after the audit wait + generation re-check,
             // so a concurrent stop cannot leave a stale first-item entry behind.
@@ -559,7 +556,7 @@ export function createPlayUrlHandler(deps: MediaUrlPipelineDeps = defaultMediaUr
                 live,
                 'media.music.start',
                 async () => {
-                  if (playlistExpansionGeneration(id) !== generation) return [];
+                  if (!isCurrent()) return [];
                   live.queue.add(item);
                   live.queue.playAt(live.queue.length - 1);
                   return live.play(item, { replaceSessionIds: opts.replaceSessionIds });
@@ -575,20 +572,20 @@ export function createPlayUrlHandler(deps: MediaUrlPipelineDeps = defaultMediaUr
                 });
               }
             }
-            if (item.sourceUrl) await saveHistory(item.sourceUrl, item.title);
+            await saveRequestHistory(req, live, item);
           },
           enqueue: (item: QueueItem) => {
-            if (playlistExpansionGeneration(id) !== generation) return;
+            if (!isCurrent()) return;
             const live = manager.getBot(id);
             if (!live || live.status === 'stopped' || live.status === 'error') return;
             live.queue.add(item);
-            if (item.sourceUrl) void saveHistory(item.sourceUrl, item.title);
+            void saveRequestHistory(req, live, item);
           },
           isIdle: () => {
             const live = manager.getBot(id);
-            return Boolean(live && live.status === 'connected' && !live.nowPlaying);
+            return Boolean(isCurrent() && live?.status === 'connected' && !live.nowPlaying);
           },
-          isCancelled: () => playlistExpansionGeneration(id) !== generation,
+          isCancelled: () => !isCurrent(),
         },
         { url, enqueueOnly },
         {
@@ -655,6 +652,7 @@ musicBotRoutes.post('/:id/play-radio', async (req: Request, res: Response, next)
     };
 
     await runMediaAudited(req, bot, 'media.music.start', () => bot.playStream(queueItem, { replaceSessionIds }), replaceSessionIds);
+    await saveRequestHistory(req, bot, queueItem);
     res.json({ success: true });
   } catch (err) { next(err); }
 });
@@ -805,7 +803,7 @@ musicBotRoutes.post('/:id/queue', async (req: Request, res: Response, next) => {
     const song = await prisma.song.findUnique({ where: { id: parseInt(songId) } });
     if (!song) throw new AppError(404, 'Song not found');
 
-    bot.queue.add({
+    const item: QueueItem = {
       id: String(song.id),
       title: song.title,
       artist: song.artist ?? undefined,
@@ -813,7 +811,9 @@ musicBotRoutes.post('/:id/queue', async (req: Request, res: Response, next) => {
       filePath: song.filePath,
       source: song.source as any,
       sourceUrl: song.sourceUrl ?? undefined,
-    });
+    };
+    bot.queue.add(item);
+    await saveRequestHistory(req, bot, item);
 
     res.json({ success: true, queueLength: bot.queue.length });
   } catch (err) { next(err); }
@@ -851,10 +851,12 @@ musicBotRoutes.post('/:id/queue/playlist', async (req: Request, res: Response, n
     // Only require a session replace when this load will actually start playback.
     if (shouldAutoplay && items.length > 0) bot.assertMusicCanStart(replaceSessionIds);
 
+    let loaded = false;
     const loadQueue = () => {
       if (clearFirst) bot.queue.clear();
       const playIndex = bot.queue.length;
       bot.queue.addMany(items);
+      loaded = true;
       return playIndex;
     };
 
@@ -875,6 +877,7 @@ musicBotRoutes.post('/:id/queue/playlist', async (req: Request, res: Response, n
       loadQueue();
     }
 
+    if (loaded) await saveRequestHistory(req, bot, items);
     res.json({ success: true, queueLength: bot.queue.length, playError });
   } catch (err) { next(err); }
 });

@@ -26,6 +26,42 @@ function fakeMusic(bot: VoiceBot) {
   b._nowPlaying = { id: '1', title: 'Neon Skyline', source: 'local', filePath: '/x.mp3' };
 }
 
+describe('stale radio startup', () => {
+  for (const outcome of ['opened', 'failed']) for (const newer of [false, true]) {
+    it(`discards an ${outcome} stream after ${newer ? 'replacement' : 'stop'}`, async () => {
+      const bot = makeBot();
+      const b = bot as any;
+      b.startIcyPolling = () => {};
+      b.updateNowPlayingNickname = () => {};
+      let resolve!: (stream: unknown) => void;
+      let reject!: (error: Error) => void;
+      let killed = 0;
+      b.pipeline.toPcmStream = () => new Promise((done, fail) => { resolve = done; reject = fail; });
+      const startup = bot.playStream({ id: 'radio', title: 'Radio', source: 'radio', filePath: '', streamUrl: 'https://example.test/radio' });
+      assert.ok(resolve);
+      const startupToken = bot.playbackToken;
+      if (newer) {
+        b.ensurePlayableFile = async () => '/newer.opus';
+        b.startFileStream = async () => true;
+        await bot.play({ id: 'newer', title: 'Newer track', source: 'local', filePath: '/newer.opus' });
+      } else bot.clearPlayback();
+      assert.notEqual(bot.playbackToken, startupToken);
+      const token = bot.playbackToken;
+      const current = bot.nowPlaying;
+      if (outcome === 'opened') resolve({ kill: () => { killed++; } });
+      else reject(new Error('old stream failed'));
+      await startup;
+      assert.equal(killed, outcome === 'opened' ? 1 : 0);
+      assert.equal(bot.playbackToken, token);
+      assert.equal(bot.nowPlaying, current);
+      assert.equal(bot.status, newer ? 'playing' : 'connected');
+      assert.equal(b.streamKill, null);
+      assert.equal(b.playbackTimer, null);
+      bot.clearPlayback();
+    });
+  }
+});
+
 function fakeVideo(bot: VoiceBot) {
   const b = bot as any;
   b._videoStreaming = true;
@@ -482,4 +518,29 @@ it('playback token resets votes on play/replay/stop but survives pause/resume/se
     bot.stopAudio();
     assert.notEqual(bot.playbackToken, replay);
   } finally { bot.stopAudio(); }
+});
+
+describe('radio requests queued from history', () => {
+  for (const action of ['finish', 'skip', 'previous'] as const) {
+    it(`plays the live stream when the queue advances through ${action}`, async () => {
+      const bot = makeBot();
+      const radio = { id: 'history_7', title: 'Station', source: 'radio' as const,
+        filePath: '', streamUrl: 'https://example.test/radio' };
+      const local = { id: 'local', title: 'Song', source: 'local' as const, filePath: '/fake.ogg' };
+      bot.queue.addMany(action === 'previous' ? [radio, local] : [local, radio]);
+      bot.queue.playAt(action === 'previous' ? 1 : 0);
+      const b = bot as any;
+      b._status = 'playing';
+      b._nowPlaying = local;
+      let received: unknown;
+      let options: unknown;
+      bot.playStream = async (item, opts) => { received = item; options = opts; return []; };
+      b.ensurePlayableFile = async () => assert.fail('radio must not resolve a local file');
+      if (action === 'finish') b.finishFileTrack();
+      else bot[action]({ replaceSessionIds: ['confirmed-session'] });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(received, radio);
+      assert.deepEqual(options, action === 'finish' ? {} : { replaceSessionIds: ['confirmed-session'] });
+    });
+  }
 });

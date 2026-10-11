@@ -128,6 +128,8 @@ export interface CommandMethods {
     args: string,
   ): Promise<void>;
   handlePlay(botId: number, bot: VoiceBot, userClid: number, args: string): Promise<void>;
+  handleHistory(botId: number, bot: VoiceBot, userClid: number, args: string): Promise<void>;
+  handleAgain(botId: number, bot: VoiceBot, userClid: number, args: string): Promise<void>;
   enqueueMediaUrl(botId: number, bot: VoiceBot, userClid: number, rawUrl: string, request?: ChatMediaRequest): Promise<void>;
   findSong(query: string, signal?: AbortSignal): ReturnType<typeof findSongForQuery>;
   handlePlaylist(botId: number, bot: VoiceBot, userClid: number, args: string): Promise<void>;
@@ -152,7 +154,7 @@ export interface CommandMethods {
   handleTv(bot: VoiceBot, userClid: number, args: string): Promise<void>;
   handleLyrics(bot: VoiceBot, userClid: number, args: string): Promise<void>;
   handleViewers(bot: VoiceBot, userClid: number): void;
-  saveMusicRequest(bot: VoiceBot, item: QueueItem): void;
+  saveMusicRequest(bot: VoiceBot, item: QueueItem | QueueItem[]): void;
 }
 
 /** Shared state of one handler; cooldown claims remain shared across handlers in dedupe.ts. */
