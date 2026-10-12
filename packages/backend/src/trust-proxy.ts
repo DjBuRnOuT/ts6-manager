@@ -1,7 +1,17 @@
-import type { NextFunction, Request, Response } from 'express';
+import type { Application, NextFunction, Request, Response } from 'express';
 
-/** Express `trust proxy` value this backend uses: `false` (trust nothing) or an explicit list. */
-export type TrustProxySetting = false | string[];
+/**
+ * `private-peer` trusts exactly one hop, and only when the connecting peer has a private
+ * address. It is the split backend image default: the bundled frontend proxy reaches the
+ * backend from a private compose address that is not known in advance.
+ */
+export const PRIVATE_PEER = 'private-peer';
+
+/** Parsed TRUST_PROXY: `false` (trust nothing), `private-peer`, or an explicit list. */
+export type TrustProxySetting = false | typeof PRIVATE_PEER | string[];
+
+/** Express asks this about the socket peer (hop 0) and then each forwarded entry from the right. */
+type TrustFunction = (address: string, hop: number) => boolean;
 
 const NONE_WORDS = new Set(['false', 'none', 'off', 'no']);
 
@@ -18,19 +28,47 @@ export function parseTrustProxy(raw: string | undefined): TrustProxySetting {
   if (lower.some(token => NONE_WORDS.has(token))) {
     throw new Error('TRUST_PROXY mixes a "none" value (false/none/off/no) with proxy addresses; use one or the other.');
   }
+  if (lower.includes(PRIVATE_PEER)) {
+    if (lower.some(token => token !== PRIVATE_PEER)) {
+      throw new Error(
+        `TRUST_PROXY mixes "${PRIVATE_PEER}" with proxy addresses; list every proxy address or range explicitly instead.`,
+      );
+    }
+    return PRIVATE_PEER;
+  }
   for (const token of tokens) {
     if (token.toLowerCase() === 'true' || /^\d+$/.test(token)) {
       throw new Error(
         `TRUST_PROXY=${token} is not supported: boolean and hop-count values trust any client at that position. ` +
-        'Use proxy IPs/CIDRs or loopback, linklocal, uniquelocal, or "none".',
+        `Use proxy IPs/CIDRs or loopback, linklocal, uniquelocal, ${PRIVATE_PEER}, or "none".`,
       );
     }
   }
   return tokens;
 }
 
+/**
+ * Set `trust proxy` on the app. Express asks about the socket peer as hop 0 and then about
+ * each X-Forwarded-For entry from the right; `req.ip` is the first address that is not
+ * trusted. For `private-peer` only hop 0 can be trusted, so `req.ip` is the address the
+ * proxy itself observed and nothing a client wrote further left is believed.
+ */
+export function applyTrustProxy(app: Application, setting: TrustProxySetting): void {
+  if (setting !== PRIVATE_PEER) {
+    app.set('trust proxy', setting);
+    return;
+  }
+  // Let Express compile the private ranges (proxy-addr) rather than keeping our own CIDR checks.
+  app.set('trust proxy', ['uniquelocal']);
+  const isPrivate = app.get('trust proxy fn') as TrustFunction;
+  const privatePeerOnly: TrustFunction = (address, hop) => hop === 0 && isPrivate(address, 0);
+  app.set('trust proxy', privatePeerOnly);
+}
+
 export function describeTrustProxy(setting: TrustProxySetting): string {
-  return setting === false ? 'none (forwarded headers ignored)' : setting.join(', ');
+  if (setting === false) return 'none (forwarded headers ignored)';
+  if (setting === PRIVATE_PEER) return `${PRIVATE_PEER} (one hop, only when the connecting peer has a private address)`;
+  return setting.join(', ');
 }
 
 /** Logs once when X-Forwarded-For arrives while no proxy is trusted. Never logs the header value. */
