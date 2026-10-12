@@ -208,6 +208,74 @@ describe('listener remote HTTP security boundary', () => {
     });
   }));
 
+  it('limits the queue by tracks still to play, not by tracks already played', async () => using(async f => {
+    const { session } = await f.exchange();
+    const track = (n: number): QueueItem => ({ id: `played-${n}`, title: `Track ${n}`, filePath: `/music/${n}.mp3`, source: 'local' });
+    // A long-running bot: 600 tracks in the queue, all but the last already played.
+    f.queue.addMany(Array.from({ length: 600 }, (_, n) => track(n)));
+    f.queue.playAt(f.queue.length - 1);
+    assert.equal(f.queue.upcomingCount, 0);
+    assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 200);
+    assert.equal(f.queue.upcomingCount, 1);
+
+    // 500 tracks waiting is the limit.
+    f.queue.addMany(Array.from({ length: 499 }, (_, n) => track(1000 + n)));
+    assert.equal(f.queue.upcomingCount, 500);
+    const full = await f.request('/queue', { session, body: { songId: 11 } });
+    assert.equal(full.status, 429);
+    assert.deepEqual(await full.json(), { error: 'The queue is full.', code: 'rate_limited' });
+    assert.equal(f.queue.upcomingCount, 500);
+  }));
+
+  it('lets only one of several simultaneous requests take the last free place', async () => using(async f => {
+    const { session } = await f.exchange();
+    const track = (n: number): QueueItem => ({ id: `waiting-${n}`, title: `Track ${n}`, filePath: `/music/${n}.mp3`, source: 'local' });
+    f.queue.addMany(Array.from({ length: 499 }, (_, n) => track(n)));
+    f.queue.playAt(0);
+    assert.equal(f.queue.upcomingCount, 499);
+    const responses = await Promise.all(Array.from({ length: 8 }, () => f.request('/queue', { session, body: { songId: 11 } })));
+    const statuses = responses.map(response => response.status).sort((a, b) => a - b);
+    assert.deepEqual(statuses, [200, 429, 429, 429, 429, 429, 429, 429]);
+    assert.equal(f.queue.upcomingCount, 500);
+  }));
+
+  it('checks the limit again when a refused start appends a tick later', async () => using(async f => {
+    const { session } = await f.exchange();
+    const track = (n: number): QueueItem => ({ id: `gap-${n}`, title: `Track ${n}`, filePath: `/music/${n}.mp3`, source: 'local' });
+    f.state.botStatus = 'connected';
+    f.bot.nowPlaying = null;
+    const conflict = () => { throw new MediaSessionConflictError('music', [{ id: 'video-1', state: 'active' } as any]); };
+
+    // A video session appears after the first check: the request is appended, not started.
+    f.bot.assertMusicCanStart = conflict;
+    const before = f.queue.length;
+    assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 200);
+    assert.equal(f.queue.length, before + 1);
+    assert.equal(f.plays.length, 0);
+
+    // The same refusal, but other requests fill the queue during the gap: nothing more is added.
+    f.bot.assertMusicCanStart = () => {
+      f.queue.addMany(Array.from({ length: 500 - f.queue.upcomingCount }, (_, n) => track(n)));
+      conflict();
+    };
+    const full = await f.request('/queue', { session, body: { songId: 11 } });
+    assert.equal(full.status, 429);
+    assert.equal(f.queue.upcomingCount, 500);
+  }));
+
+  it('still caps the whole queue so played tracks cannot accumulate without bound', async () => using(async f => {
+    const { session } = await f.exchange();
+    const track = (n: number): QueueItem => ({ id: `old-${n}`, title: `Track ${n}`, filePath: `/music/${n}.mp3`, source: 'local' });
+    f.queue.addMany(Array.from({ length: 4998 }, (_, n) => track(n)));
+    f.queue.playAt(f.queue.length - 1);
+    assert.equal(f.queue.length, 4999);
+    assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 200);
+    assert.equal(f.queue.length, 5000);
+    const full = await f.request('/queue', { session, body: { songId: 11 } });
+    assert.equal(full.status, 429);
+    assert.equal(f.queue.length, 5000);
+  }));
+
   it('applies the scoped shared policy to every read and write, and reflects subsequent policy changes', async () => using(async f => {
     const { session } = await f.exchange();
     restrict(f, [7]);

@@ -18,6 +18,10 @@ import { musicHistoryErrorCode, recordMusicRequests } from '../voice/music-reque
 export const listenerRemoteRoutes: Router = Router();
 export const listenerRemoteAdminRoutes: Router = Router();
 const resolvingBots = new WeakMap<ListenerRemoteService, Set<number>>();
+/** Tracks waiting to play that a listener request may add to. */
+const MAX_UPCOMING_TRACKS = 500;
+/** Played and waiting tracks together; reached only on a bot whose queue is never cleared. */
+const MAX_QUEUE_ITEMS = 5000;
 
 function service(req: Request): ListenerRemoteService {
   const value = req.app.locals.listenerRemote;
@@ -170,7 +174,14 @@ async function append(req: Request, binding: ListenerRemoteBinding, resolveItem:
     await authorized(req, 'add', 'request');
     const item = await resolveItem();
     const { bot } = await authorized(req, 'add', 'request');
-    if (bot.queue.length >= 500) fail(429, 'rate_limited', 'The queue is full.');
+    // Count what is still to play: tracks already played stay in the queue and must not use up the limit.
+    // The total is capped separately so listener requests cannot grow one queue without bound.
+    const assertRoom = () => {
+      if (bot.queue.upcomingCount >= MAX_UPCOMING_TRACKS || bot.queue.length >= MAX_QUEUE_ITEMS) {
+        fail(429, 'rate_limited', 'The queue is full.');
+      }
+    };
+    assertRoom();
     // Conservative: a listener may only start music on an idle bot. Anything
     // already playing or paused is never touched, and an active video stream is
     // never replaced (no replaceSessionIds, unlike a chat !play); the item is
@@ -185,6 +196,8 @@ async function append(req: Request, binding: ListenerRemoteBinding, resolveItem:
         queued = await startOrAppendMediaItem(bot, item, () => botFor(req, binding) === bot, { replaceSessionIds: [] });
       } catch (err) {
         if (!(err instanceof MediaSessionConflictError)) throw err;
+        // The rejected start resumed on a later tick; another request may have added meanwhile.
+        assertRoom();
         bot.queue.add(item);
         queued = true;
       }
