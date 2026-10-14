@@ -427,6 +427,10 @@ type EncoderCapabilities struct {
 	VaapiDevicePresent bool                 `json:"vaapiDevicePresent"`
 	HwDecode           bool                 `json:"hwDecode"`
 	Encoders           []EncoderProbeResult `json:"encoders"`
+	// AV1HwDecode is whether FFmpeg decodes AV1 on a GPU here (any entry of
+	// AV1Decode). Streams use it only with VIDEO_HW_DECODE=1.
+	AV1HwDecode bool             `json:"av1HwDecode"`
+	AV1Decode   []AV1DecodeProbe `json:"av1Decode"`
 }
 
 func (c *EncoderCapabilities) find(id string) (EncoderProbeResult, bool) {
@@ -594,15 +598,19 @@ func probeEncodersIn(run probeRunner, list ffmpegEncoderList) *EncoderCapabiliti
 
 // capabilityCache holds the last probe so routine requests never re-probe.
 type capabilityCache struct {
-	mu   sync.Mutex
-	caps *EncoderCapabilities
-	run  probeRunner
+	// probeMu serializes refreshes without blocking reads of published capabilities.
+	probeMu sync.Mutex
+	mu      sync.Mutex
+	caps    *EncoderCapabilities
+	run     probeRunner
 	// list is the encoder list of the ffmpeg at listPath, asked for once.
 	// listAsked is set even when the answer was unusable, so a broken ffmpeg
 	// is not run again for every stream start. A refresh asks again.
-	list      ffmpegEncoderList
-	listPath  string
-	listAsked bool
+	list        ffmpegEncoderList
+	listPath    string
+	listAsked   bool
+	av1         av1DecodeCache
+	av1Software av1SoftwareDecoderCache
 }
 
 func (c *capabilityCache) runner() probeRunner {
@@ -634,11 +642,46 @@ func (c *capabilityCache) missingReason(spec EncoderSpec) string {
 
 func (c *capabilityCache) get(refresh bool) *EncoderCapabilities {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.caps == nil || refresh {
-		c.caps = probeEncodersIn(c.runner(), c.encoderListLocked(refresh))
+	cached := c.caps
+	c.mu.Unlock()
+	if cached != nil && !refresh {
+		return cached
 	}
-	return c.caps
+
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	c.mu.Lock()
+	if c.caps != nil && !refresh {
+		cached = c.caps
+		c.mu.Unlock()
+		return cached
+	}
+	run := c.runner()
+	list := c.encoderListLocked(refresh)
+	c.mu.Unlock()
+
+	caps := probeEncodersIn(run, list)
+	// Decode probes can crash faulty drivers. They are unnecessary when GPU
+	// decoding is disabled, and must not hold the lock used by stream startup.
+	// An empty list (not null) tells the backend this sidecar does report AV1
+	// decoding and simply tested no GPU; hwDecode says why.
+	caps.AV1Decode = []AV1DecodeProbe{}
+	if caps.HwDecode {
+		caps.AV1Decode = c.av1.probeAll(run, caps, refresh)
+	}
+	for _, r := range caps.AV1Decode {
+		caps.AV1HwDecode = caps.AV1HwDecode || r.Available
+	}
+	c.mu.Lock()
+	c.caps = caps
+	c.mu.Unlock()
+	return caps
+}
+
+// av1Decode is the cached AV1 test decode for hwaccel and device, run on first
+// use.
+func (c *capabilityCache) av1Decode(hwaccel, device string) AV1DecodeProbe {
+	return c.av1.get(c.runner(), hwaccel, device, false)
 }
 
 func (c *capabilityCache) peek() *EncoderCapabilities {

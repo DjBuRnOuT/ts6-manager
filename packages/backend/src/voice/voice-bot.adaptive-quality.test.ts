@@ -119,6 +119,60 @@ describe('adaptive Auto quality on a running stream', () => {
     assert.match(bot.videoStreamStatus.health?.warning ?? '', /below realtime/, 'the warning is still shown');
   });
 
+  it('reports a decoder fallback from a later stats sample, even before health is available', async () => {
+    const { bot, b } = streamingBot('1080p', '1080p', 'live');
+    const warnings = mock.method(console, 'warn', () => {});
+    const changes: string[] = [];
+    bot.on('statusChange', () => changes.push(bot.videoStreamStatus.encoder?.decoder ?? ''));
+    b._videoEncoder.decoder = 'av1 (vaapi)';
+    b.sidecarHttp.getStats = async () => ({
+      encoder: {
+        requested: 'vp8', active: 'vp8', codec: 'vp8', hardware: false, state: 'running',
+        decoder: 'libdav1d', decoderFallbackReason: 'Failed to get HW surface format',
+      },
+      health: null,
+    });
+    try {
+      await bot.pollVideoHealth();
+      await bot.pollVideoHealth();
+      assert.equal(bot.videoStreamStatus.encoder?.decoder, 'libdav1d');
+      assert.equal(bot.videoStreamStatus.encoder?.decoderFallbackReason, 'Failed to get HW surface format');
+      assert.deepEqual(changes, ['libdav1d'], 'publish the change once');
+      assert.equal(warnings.mock.callCount(), 1, 'do not log the same fallback on every poll');
+    } finally {
+      warnings.mock.restore();
+    }
+  });
+
+  for (const replacement of ['stream', 'client', 'encoder', 'stop', 'source-change', 'volume-restart', 'quality-restart'] as const) {
+    it(`ignores a stats response after ${replacement} replacement or cancellation`, async () => {
+      const { bot, b } = streamingBot('1080p', '1080p', 'live');
+      let finish!: (stats: unknown) => void;
+      b.sidecarHttp.getStats = () => new Promise(resolve => { finish = resolve; });
+      let ended = false;
+      b.handleVideoSourceFinished = async () => { ended = true; };
+      const polling = bot.pollVideoHealth();
+      if (replacement === 'stream') b._activeStreamId = 'stream-2';
+      if (replacement === 'client') b.sidecarHttp = {};
+      if (replacement === 'encoder') b._videoEncoder = { ...b._videoEncoder, decoder: 'av1 (cuda)' };
+      if (replacement === 'stop') b._videoStopping = true;
+      if (replacement === 'source-change') b._videoSourceChangesPending = 1;
+      if (replacement === 'volume-restart') b._volumePushActive = true;
+      if (replacement === 'quality-restart') b._qualityChangeActive = true;
+      finish({
+        encoder: {
+          requested: 'vp8', active: 'vp8', codec: 'vp8', hardware: false, state: 'exited',
+          decoder: 'libdav1d', decoderFallbackReason: 'old failure', exitError: 'old stream failed',
+        },
+        health: overloaded(),
+      });
+      await polling;
+      assert.equal(ended, false, 'the old exit must not stop the new stream');
+      assert.equal(bot.videoStreamStatus.encoder?.decoderFallbackReason, undefined);
+      assert.equal(bot.videoStreamStatus.health, null);
+    });
+  }
+
   it('steps back up after a stable recovery, one preset at a time, never above where Auto started', async () => {
     const { bot, sources, poll } = streamingBot('auto', '1080p', 'live');
     await poll(overloaded());
@@ -148,6 +202,25 @@ describe('adaptive Auto quality on a running stream', () => {
     assert.deepEqual(ended, []);
     mock.timers.tick(3_000);
     assert.deepEqual(ended, ['source_ended']);
+  });
+
+  it("restarts with the re-resolved source's audio input and video codec, and shows an AV1 decoder fallback", async () => {
+    const { b, sources, poll } = streamingBot('auto', '1080p', 'live');
+    b.resolveRunningSource = async () => ({
+      sourcePath: 'https://rr.example/v', audioPath: 'https://rr.example/a', videoCodec: 'av1', loop: false,
+    });
+    b.sidecarHttp.setSource = async (_s: string, options: Record<string, unknown>) => {
+      sources.push(options);
+      return {
+        requested: 'h264_vaapi', active: 'h264_vaapi', codec: 'h264', hardware: true, state: 'running',
+        decoder: 'libdav1d', decoderFallbackReason: 'Failed to get HW surface format',
+      };
+    };
+    await poll(overloaded());
+    assert.equal(sources[0].audioSource, 'https://rr.example/a');
+    assert.equal(sources[0].videoCodec, 'av1');
+    assert.equal(b._videoEncoder.decoder, 'libdav1d');
+    assert.equal(b._videoEncoder.decoderFallbackReason, 'Failed to get HW surface format');
   });
 
   it('wraps the position of a looped local file', async () => {

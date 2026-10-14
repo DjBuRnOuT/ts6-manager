@@ -34,7 +34,7 @@ import { SidecarClient, type SidecarEncoderSession, type SidecarStreamHealth } f
 import { AdaptiveQualityController, type QualityDecision } from './streaming/adaptive-quality.js';
 import { SidecarProcess, type SidecarConfig } from './streaming/sidecar-process.js';
 import { STREAM_PRESETS, DEFAULT_PRESET, type VideoViewerInfo, type VideoStreamStatus } from './streaming/types.js';
-import { downloadVideoForStream, safeUnlinkStreamTemp, resolvePathUnderMusicDir } from './streaming/video-download.js';
+import { downloadVideoForStream, safeUnlinkStreamTemp, resolvePathUnderMusicDir, type SourceVideoCodec } from './streaming/video-download.js';
 import { effectiveBitrate, normalizeQualityRequest, resolveQuality } from './streaming/quality.js';
 import {
   ENCODER_CODEC,
@@ -693,10 +693,11 @@ export class VoiceBot extends EventEmitter {
     live?: boolean;
     durationSec: number | null;
     resolution?: { width: number; height: number };
+    videoCodec?: SourceVideoCodec;
   }> {
     const maxDur = this.config.maxVideoDurationSec ?? 900;
     const youtubeDirect = await this.youtubeDirectStream();
-    const { path: filePath, audioPath, durationSec, live, resolution } = await downloadVideoForStream(
+    const { path: filePath, audioPath, durationSec, live, resolution, videoCodec } = await downloadVideoForStream(
       source,
       maxHeight,
       maxDur,
@@ -728,10 +729,10 @@ export class VoiceBot extends EventEmitter {
     // after the sidecar accepts the source in applyVideoSource.
     if (live === false && durationSec != null && durationSec > 0) {
       this._videoDurationSec = durationSec;
-      return { path: filePath, audioPath, loop: false, live, durationSec, resolution };
+      return { path: filePath, audioPath, loop: false, live, durationSec, resolution, videoCodec };
     }
 
-    return { path: filePath, audioPath, loop: true, live, durationSec, resolution };
+    return { path: filePath, audioPath, loop: true, live, durationSec, resolution, videoCodec };
   }
 
   /** A failed read keeps the default: download first. */
@@ -1553,14 +1554,14 @@ export class VoiceBot extends EventEmitter {
   /** Resolve the running source again for an encoder restart (volume or quality change). */
   private async resolveRunningSource(
     maxHeight: number,
-  ): Promise<{ sourcePath: string; audioPath?: string; loop: boolean }> {
+  ): Promise<{ sourcePath: string; audioPath?: string; videoCodec?: SourceVideoCodec; loop: boolean }> {
     if (this._videoTempFile) {
       try {
         return { sourcePath: resolvePathUnderMusicDir(this._videoTempFile), loop: false };
       } catch { /* the download is gone: resolve it again */ }
     }
     const resolved = await this.resolveStreamSource(this._videoSource!, maxHeight);
-    return { sourcePath: resolved.path, audioPath: resolved.audioPath, loop: resolved.loop };
+    return { sourcePath: resolved.path, audioPath: resolved.audioPath, videoCodec: resolved.videoCodec, loop: resolved.loop };
   }
 
   /** Restart the running encode so the sidecar picks up `_videoStreamVolume`. */
@@ -1570,13 +1571,13 @@ export class VoiceBot extends EventEmitter {
     }
     // Reuse the resolved quality: a volume change must not re-probe the source.
     const quality = this._videoQuality ?? resolveQuality(this._videoPreset, this._videoSettings.autoMaxPreset, null);
-    const { sourcePath, audioPath, loop } = await this.resolveRunningSource(STREAM_PRESETS[quality.actual].height);
+    const { sourcePath, audioPath, videoCodec, loop } = await this.resolveRunningSource(STREAM_PRESETS[quality.actual].height);
     // Source resolution can take a while; a stop or source change that began
     // meanwhile owns the sidecar now, and a /source here would restart ffmpeg
     // after the stop, or on the old source.
     if (!this.canPushVideoVolume()) return;
     const mode: VideoSourceMode = /^https?:\/\//i.test(sourcePath) ? (this._videoSourceMode ?? 'vod') : 'file';
-    await this.sendSourceToSidecar(sourcePath, loop && mode === 'file', quality, mode, audioPath);
+    await this.sendSourceToSidecar(sourcePath, loop && mode === 'file', quality, mode, { audioSource: audioPath, videoCodec });
     // setSource restarts ffmpeg from the beginning for volume changes, so
     // refresh the auto-stop timer from now for non-looping on-demand clips.
     if (!loop && this._videoDurationSec != null) {
@@ -1949,10 +1950,23 @@ export class VoiceBot extends EventEmitter {
   /** One health sample; stops the stream with a truthful reason if ffmpeg died. */
   async pollVideoHealth(): Promise<void> {
     if (!this._videoStreaming || !this.sidecarHttp || this._videoHealthPolling || this._videoStopping) return;
+    if (this._videoSourceChangesPending > 0 || this._volumePushActive || this._qualityChangeActive) return;
     this._videoHealthPolling = true;
+    const sidecar = this.sidecarHttp;
+    const streamId = this._activeStreamId;
+    const encoder = this._videoEncoder;
     try {
-      const stats = await this.sidecarHttp.getStats();
-      if (!this._videoStreaming || this._videoStopping) return;
+      const stats = await sidecar.getStats();
+      if (!this._videoStreaming || this._videoStopping || this.sidecarHttp !== sidecar
+        || this._activeStreamId !== streamId || this._videoEncoder !== encoder
+        || this._videoSourceChangesPending > 0 || this._volumePushActive || this._qualityChangeActive) return;
+
+      // A GPU decoder can fail after POST /source has already returned. Refresh
+      // its session even when FFmpeg has not produced a health sample yet.
+      // Older sidecars may omit the session; keep the startup result in that case.
+      if (stats.encoder && isEncoderId(stats.encoder.active) && this.applyEncoderSession(stats.encoder)) {
+        this.emit('statusChange', this._status);
+      }
 
       if (stats.encoder?.state === 'exited') {
         const exit = classifyEncoderExit({
@@ -2064,7 +2078,7 @@ export class VoiceBot extends EventEmitter {
     const preset = STREAM_PRESETS[decision.to];
     const target: VideoStreamQualityInfo = { ...previous, actual: decision.to, width: preset.width, height: preset.height };
 
-    let resolved: { sourcePath: string; audioPath?: string; loop: boolean };
+    let resolved: { sourcePath: string; audioPath?: string; videoCodec?: SourceVideoCodec; loop: boolean };
     try {
       resolved = await this.resolveRunningSource(preset.height);
     } catch (err) {
@@ -2083,7 +2097,7 @@ export class VoiceBot extends EventEmitter {
     } catch { /* keep the sampled position */ }
     if (this._videoAdaptive !== ctl || !this.canPushVideoVolume()) return;
 
-    const { sourcePath, audioPath } = resolved;
+    const { sourcePath, audioPath, videoCodec } = resolved;
     const mode: VideoSourceMode = /^https?:\/\//i.test(sourcePath) ? (this._videoSourceMode ?? 'vod') : 'file';
     const loop = resolved.loop && mode === 'file';
     const startAt = this.resumeOffset(positionSecs, loop);
@@ -2098,13 +2112,13 @@ export class VoiceBot extends EventEmitter {
     }
 
     try {
-      await this.sendSourceToSidecar(sourcePath, loop, target, mode, audioPath, startAt);
+      await this.sendSourceToSidecar(sourcePath, loop, target, mode, { audioSource: audioPath, videoCodec }, startAt);
     } catch (err) {
       ctl.rejectFailedStart(decision, Date.now());
       // The sidecar stops the old encode before it starts the new one, so a
       // failed start can leave nothing running. Go back to what was working.
       try {
-        await this.sendSourceToSidecar(sourcePath, loop, previous, mode, audioPath, startAt);
+        await this.sendSourceToSidecar(sourcePath, loop, previous, mode, { audioSource: audioPath, videoCodec }, startAt);
         if (remainingSec != null) this.scheduleVideoEndStop(remainingSec);
       } catch {
         this._qualityChangeActive = false;
@@ -2132,9 +2146,9 @@ export class VoiceBot extends EventEmitter {
   // ─── Source / encoder application ─────────────────────────
 
   /** Record what the sidecar reports running; an old sidecar ignores encoders and runs VP8. */
-  private applyEncoderSession(session: SidecarEncoderSession | null): void {
+  private applyEncoderSession(session: SidecarEncoderSession | null): boolean {
     const enc = this._videoEncoder;
-    if (!enc) return;
+    if (!enc) return false;
     if (!session || !isEncoderId(session.active)) {
       this._videoEncoder = {
         ...enc,
@@ -2144,8 +2158,10 @@ export class VoiceBot extends EventEmitter {
         fallbackReason: enc.selected === 'vp8'
           ? null
           : 'Sidecar did not report encoder support — update the sidecar image',
+        decoder: null,
+        decoderFallbackReason: null,
       };
-      return;
+      return true;
     }
     this._videoEncoder = {
       ...enc,
@@ -2153,12 +2169,23 @@ export class VoiceBot extends EventEmitter {
       codec: ENCODER_CODEC[session.active],
       hardware: isHardwareEncoder(session.active),
       fallbackReason: session.fallbackReason || null,
+      decoder: session.decoder || null,
+      decoderFallbackReason: session.decoderFallbackReason || null,
     };
-    if (session.fallbackReason) {
+    if (session.fallbackReason && session.fallbackReason !== enc.fallbackReason) {
       console.warn(
         `[VoiceBot ${this.config.id}] Encoder fallback ${session.requested} → ${session.active}: ${session.fallbackReason}`,
       );
     }
+    if (session.decoderFallbackReason && session.decoderFallbackReason !== enc.decoderFallbackReason) {
+      console.warn(
+        `[VoiceBot ${this.config.id}] AV1 GPU decoding failed, decoding on the CPU (${session.decoder || 'software'}): ${session.decoderFallbackReason}`,
+      );
+    }
+    const next = this._videoEncoder;
+    return enc.active !== next.active || enc.fallbackReason !== next.fallbackReason
+      || (enc.decoder ?? null) !== next.decoder
+      || (enc.decoderFallbackReason ?? null) !== next.decoderFallbackReason;
   }
 
   /** (Re)start sidecar ffmpeg for an already-resolved path at `quality`. */
@@ -2167,7 +2194,7 @@ export class VoiceBot extends EventEmitter {
     loop: boolean,
     quality: VideoStreamQualityInfo,
     mode: VideoSourceMode,
-    audioSource?: string,
+    inputs: { audioSource?: string; videoCodec?: SourceVideoCodec } = {},
     startAtSecs?: number,
   ): Promise<void> {
     if (!this.sidecarHttp || !this._videoEncoder) throw new Error('No active video stream');
@@ -2189,7 +2216,8 @@ export class VoiceBot extends EventEmitter {
       mode,
       allowedHosts: this._videoLocalHosts,
       cpuUsed: this._videoSettings.cpuUsed,
-      audioSource,
+      audioSource: inputs.audioSource,
+      ...(inputs.videoCodec ? { videoCodec: inputs.videoCodec } : {}),
       ...(startAtSecs ? { startAtSecs } : {}),
     });
 
@@ -2261,7 +2289,10 @@ export class VoiceBot extends EventEmitter {
     if (quality.note) {
       console.log(`[VoiceBot ${this.config.id}] Auto quality → ${quality.actual}: ${quality.note}`);
     }
-    await this.sendSourceToSidecar(resolved.path, resolved.loop && mode === 'file', quality, mode, resolved.audioPath);
+    await this.sendSourceToSidecar(resolved.path, resolved.loop && mode === 'file', quality, mode, {
+      audioSource: resolved.audioPath,
+      videoCodec: resolved.videoCodec,
+    });
     // Each source starts at Auto's own choice, which is as high as it may go.
     this._videoAdaptive = requested === 'auto' ? new AdaptiveQualityController(quality.actual) : null;
     this._videoSourceDurationSec = probe?.durationSec ?? resolved.durationSec ?? null;
