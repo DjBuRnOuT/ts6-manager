@@ -3,12 +3,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
-import { PlayQueue } from './playlist/queue.js';
+import { MAX_QUEUE_ITEMS, PlayQueue, QueueFullError } from './playlist/queue.js';
+import type { MediaUrlPipelineDeps } from './media-url-pipeline.js';
 import { BUILTIN_COMMAND_HELP, isReservedChatCommandName } from './chat-commands.js';
 
 const musicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-history-'));
 process.env.MUSIC_DIR = musicDir;
 const { MusicCommandHandler } = await import('./music-command-handler.js');
+const { enqueueMediaUrl } = await import('./commands/queue.js');
 after(() => fs.rmSync(musicDir, { recursive: true, force: true }));
 
 const row = (id: number, overrides: object = {}) => ({
@@ -372,4 +374,40 @@ test('failed local and radio startup removes its entry and preserves accepted du
     assert.deepEqual(f.saved, []);
     assert.deepEqual(f.replies, ['Error: Startup failed']);
   }
+});
+
+test('!again on a full queue is refused and leaves the queue as it was', async () => {
+  const f = fixture([row(1, { source: 'radio', url: 'https://8.8.8.8/radio' })]);
+  f.bot.queue.addMany(Array.from({ length: MAX_QUEUE_ITEMS }, (_, i) => ({ id: `q${i}`, title: `Q${i}`, filePath: '', source: 'local' })));
+  const before = f.bot.queue.getAll();
+  await f.command('!again');
+  assert.deepEqual(f.bot.queue.getAll(), before);
+  assert.equal(f.bot.queue.index, -1);
+  assert.deepEqual(f.played, []);
+  assert.deepEqual(f.saved, []);
+  assert.deepEqual(f.replies, ['Error: The queue is full (limit 5,000 tracks).']);
+});
+
+test('a chat link on a full queue is refused before anything downloads', async () => {
+  const f = fixture();
+  f.bot.queue.addMany(Array.from({ length: MAX_QUEUE_ITEMS }, (_, i) => ({ id: `q${i}`, title: `Q${i}`, filePath: '', source: 'local' })));
+  f.handler.virtualServerIdForBot = () => 2;
+  // The real chat path with stubbed resolvers: nothing may reach the network.
+  const downloads: string[] = [];
+  const deps: MediaUrlPipelineDeps = {
+    resolveSpotify: async (url) => url,
+    resolveAppleMusic: async () => ({ tracks: [] }),
+    resolveSpotifyCollection: async () => null,
+    appleTrackToYouTube: async () => null,
+    expandYouTube: async () => null,
+    downloadTrack: async (url) => { downloads.push(url); throw new Error('must not download'); },
+  };
+  await assert.rejects(
+    enqueueMediaUrl(f.handler.context, 1, f.bot, 2, 'https://8.8.8.8/media/a.mp3', undefined, deps),
+    (err: unknown) => err instanceof QueueFullError,
+  );
+  assert.deepEqual(downloads, []);
+  assert.equal(f.bot.queue.length, MAX_QUEUE_ITEMS);
+  assert.deepEqual(f.played, []);
+  assert.deepEqual(f.saved, []);
 });
