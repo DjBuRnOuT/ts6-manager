@@ -173,6 +173,13 @@ export class VoiceBot extends EventEmitter {
    * stopped or replaced track never starts. Pausing does not replace it.
    */
   private playbackOwner: object = {};
+  /**
+   * Advanced by an explicit Stop (music, or video when the caller asks), a
+   * queue clear and stopping the bot; never by a skip, a track change, Auto-DJ,
+   * media replacement or an automatic video stop. A slow request compares it
+   * before queueing, so music it resolved before a Stop cannot start after it.
+   */
+  private _stopGeneration = 0;
   private fileStdout: Readable | null = null;
   private fileFramesSent = 0;
   private fileBaseSeconds = 0;
@@ -361,6 +368,11 @@ export class VoiceBot extends EventEmitter {
   /** Changes for every playback start/stop, even when replaying the same queue item. */
   get playbackToken(): object {
     return this.playbackOwner;
+  }
+
+  /** Changes on every explicit Stop or queue clear; see {@link _stopGeneration}. */
+  get stopGeneration(): number {
+    return this._stopGeneration;
   }
 
   get nowPlaying(): QueueItem | null {
@@ -857,6 +869,7 @@ export class VoiceBot extends EventEmitter {
   async stop(): Promise<void> {
     this.connectionIntent++;
     this.connectionEpoch++;
+    this._stopGeneration++;
     this.automation?.disconnected();
     this._manuallyStopped = true;
     this.avatarAbort?.abort();
@@ -1358,7 +1371,10 @@ export class VoiceBot extends EventEmitter {
   /** Stop current audio without disconnecting the bot (used by clear-queue). */
   clearPlayback(reason: MediaStopReason = 'manual', detail: string | null = null): void {
     const hadMusic = this.musicActive;
-    if (reason === 'manual') this.automation?.manualStop();
+    if (reason === 'manual') {
+      this._stopGeneration++;
+      this.automation?.manualStop();
+    }
     if (hadMusic) this.endMusicSession(reason, detail);
     this.stopIcyPolling();
     this.stopPlayback();
@@ -1622,8 +1638,10 @@ export class VoiceBot extends EventEmitter {
     }
   }
 
-  stopAudio(): void {
+  /** Stop music. A skip past the last track passes `keepPendingRequests`, so requests still loading are kept. */
+  stopAudio(options: { keepPendingRequests?: boolean } = {}): void {
     const hadMusic = this.musicActive;
+    if (!options.keepPendingRequests) this._stopGeneration++;
     this.automation?.manualStop();
     if (hadMusic) this.endMusicSession('manual', null);
     this.stopIcyPolling();
@@ -2672,9 +2690,15 @@ export class VoiceBot extends EventEmitter {
   /**
    * Stop video streaming, recording why it stopped. A caller that arrives
    * while a stop is running waits for that same stop, so nothing (music, a
-   * new stream) starts before the old stream is gone.
+   * new stream) starts before the old stream is gone. An explicit Stop passes
+   * `cancelPendingRequests`, so music requests still loading are dropped too.
    */
-  stopVideoStream(reason: MediaStopReason = 'manual', detail: string | null = null): Promise<void> {
+  stopVideoStream(
+    reason: MediaStopReason = 'manual',
+    detail: string | null = null,
+    options: { cancelPendingRequests?: boolean } = {},
+  ): Promise<void> {
+    if (options.cancelPendingRequests) this._stopGeneration++;
     if (reason === 'manual') this.automation?.manualStop();
     if (!this._videoStopPromise) {
       this._videoStopPromise = this.stopVideoStreamOnce(reason, detail).finally(() => {

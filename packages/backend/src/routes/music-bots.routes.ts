@@ -803,12 +803,18 @@ musicBotRoutes.post('/:id/queue', async (req: Request, res: Response, next) => {
   try {
     const prisma = req.app.locals.prisma;
     const manager: VoiceBotManager = req.app.locals.voiceBotManager;
-    const bot = manager.getBot(parseInt(req.params.id as string));
+    const botId = parseInt(req.params.id as string);
+    const bot = manager.getBot(botId);
     if (!bot) throw new AppError(404, 'Music bot not found');
+    // A Stop, queue clear or bot restart while the song is looked up drops this add.
+    const stopGeneration = bot.stopGeneration;
 
     const { songId } = req.body;
     const song = await prisma.song.findUnique({ where: { id: parseInt(songId) } });
     if (!song) throw new AppError(404, 'Song not found');
+    if (manager.getBot(botId) !== bot || bot.stopGeneration !== stopGeneration) {
+      throw new AppError(409, 'Playback was stopped before this song was added.');
+    }
 
     const item: QueueItem = {
       id: String(song.id),
@@ -926,7 +932,8 @@ musicBotRoutes.delete('/:id/queue/:index', async (req: Request, res: Response, n
   } catch (err) { next(err); }
 });
 
-// DELETE /:id/queue — Clear queue and stop current playback
+// DELETE /:id/queue — Clear queue and stop current playback; like stop-playback,
+// cancels console and chat requests still resolving.
 musicBotRoutes.delete('/:id/queue', async (req: Request, res: Response, next) => {
   try {
     const manager: VoiceBotManager = req.app.locals.voiceBotManager;
@@ -934,6 +941,7 @@ musicBotRoutes.delete('/:id/queue', async (req: Request, res: Response, next) =>
     const bot = manager.getBot(id);
     if (!bot) throw new AppError(404, 'Music bot not found');
     invalidatePlaylistExpansion(id);
+    invalidateChatPlaylistExpansion(id);
     bot.queue.clear();
     bot.clearPlayback();
     res.json({ success: true });
@@ -1067,7 +1075,7 @@ musicBotRoutes.post('/:id/stream/stop', async (req: Request, res: Response, next
     const manager: VoiceBotManager = req.app.locals.voiceBotManager;
     const bot = manager.getBot(parseInt(req.params.id as string));
     if (!bot) throw new AppError(404, 'Music bot not found');
-    await runMediaAudited(req, bot, 'media.video.stop', () => bot.stopVideoStream('manual', 'Stopped from the web UI'));
+    await runMediaAudited(req, bot, 'media.video.stop', () => bot.stopVideoStream('manual', 'Stopped from the web UI', { cancelPendingRequests: true }));
     res.json({ success: true });
   } catch (err) { next(err); }
 });

@@ -1,6 +1,7 @@
 import type { VoiceBot } from '../voice-bot.js';
 import { QueueFullError, type QueueItem, type QueueReservation } from '../playlist/queue.js';
 import { defaultMediaUrlDeps, runMediaUrlPipeline, type MediaUrlPipelineDeps } from '../media-url-pipeline.js';
+import { invalidatePlaylistExpansion } from '../playlist-expansion.js';
 import { musicHistoryErrorCode, recordMusicRequests } from '../music-request-history.js';
 import { formatQueueMessage } from '../ts6-chat-format.js';
 import type { CommandContext } from './context.js';
@@ -184,6 +185,8 @@ export async function handlePlaylist(
 ): Promise<void> {
   const serverConfigId = bot.currentConfig.serverConfigId;
   if (!serverConfigId) { context.reply(bot, userClid, 'No server configured.'); return; }
+  // A Stop, queue clear or bot restart while the playlist is looked up drops this load.
+  const stopGeneration = bot.stopGeneration;
   const where = { OR: [{ serverConfigId }, { serverConfigId: null }] };
   const playlists = await context.prisma.playlist.findMany({
     where, select: { id: true, name: true }, orderBy: { name: 'asc' },
@@ -209,6 +212,10 @@ export async function handlePlaylist(
     include: { songs: { include: { song: true }, orderBy: { position: 'asc' } } },
   });
   if (!playlist?.songs.length) { context.reply(bot, userClid, 'Playlist is empty.'); return; }
+  if (context.voiceBotManager.getBot(botId) !== bot || bot.stopGeneration !== stopGeneration) {
+    void context.reply(bot, userClid, 'Playback was stopped before the playlist was loaded.');
+    return;
+  }
   const items: QueueItem[] = playlist.songs.map(({ song }) => ({
     id: String(song.id), title: song.title, artist: song.artist ?? undefined,
     duration: song.duration ?? undefined, filePath: song.filePath,
@@ -343,9 +350,10 @@ export async function handleQueue(
     return;
   }
 
-  // !queue clear
+  // !queue clear — like !stop, cancels chat and console requests still resolving
   if (args.toLowerCase() === 'clear') {
     invalidateChatPlaylistExpansion(bot.currentConfig.id);
+    invalidatePlaylistExpansion(bot.currentConfig.id);
     bot.queue.clear();
     bot.clearPlayback();
     context.reply(bot, userClid, 'Queue cleared.');

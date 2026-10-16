@@ -30,6 +30,8 @@ function appFor(options: {
   conflict?: boolean;
   failHistoryUpdate?: boolean;
   finishAudit?: () => Promise<void>;
+  beginAudit?: () => Promise<void>;
+  findRequest?: () => Promise<void>;
   download?: (url: string) => Promise<unknown>;
 } = {}) {
   const played: string[] = [];
@@ -52,7 +54,7 @@ function appFor(options: {
     }),
   };
   const bot = {
-    nowPlaying: null as any,
+    nowPlaying: null as any, stopGeneration: 0,
     id: 3, status: 'connected', assertMusicCanStart: (ids: string[]) => {
       if (options.conflict && !ids?.includes('11111111-1111-4111-8111-111111111111')) throw new MediaSessionConflictError('music', [{
         id: '11111111-1111-4111-8111-111111111111', kind: 'video', state: 'active', botId: 3, botName: 'Cinema', startedAt: 0,
@@ -86,14 +88,16 @@ function appFor(options: {
           if (skip != null) return filtered.slice(skip);
           return filtered.map(row => Object.fromEntries(Object.keys(select).map(key => [key, row[key] ?? null])));
         },
-        findFirst: async ({ where }: { where: { id: number; serverConfigId: number } }) =>
-          rows.find((row) => row.id === where.id && row.serverConfigId === where.serverConfigId) ?? null,
+        findFirst: async ({ where }: { where: { id: number; serverConfigId: number } }) => {
+          await options.findRequest?.();
+          return rows.find((row) => row.id === where.id && row.serverConfigId === where.serverConfigId) ?? null;
+        },
         update: async (args: unknown) => { if (options.failHistoryUpdate) throw new AppError(503, 'History storage unavailable'); updates.push(args); },
         upsert: async (args: unknown) => { recorded.push(args); return {}; },
         deleteMany: async () => ({ count: 0 }),
       },
       userServerAccess: { findUnique: async () => options.allowServerAccess ? { userId: 1, serverConfigId: 1 } : null },
-      adminAuditEvent: { create: async () => ({ id: 'audit' }), updateMany: async () => {
+      adminAuditEvent: { create: async () => { await options.beginAudit?.(); return { id: 'audit' }; }, updateMany: async () => {
         await options.finishAudit?.();
         return { count: 1 };
       } },
@@ -291,6 +295,71 @@ for (const change of ['stop', 'replace', 'none']) {
     } finally { release(); await replay; }
   });
 }
+
+test('replay is dropped when Stop or a queue clear runs while its start is audited', async () => {
+  for (const source of ['local', 'radio']) {
+    const file = 'stopped.mp3';
+    if (source === 'local') await writeFile(path.join(musicRoot, file), 'audio');
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const f = appFor({ rows: [{ id: 7, title: 'Stopped', url: source === 'local' ? file : 'https://8.8.8.8/radio',
+      source, status: 'available', serverConfigId: 1, musicBotId: 3 }],
+      beginAudit: async () => { entered(); await gate; } });
+    try {
+      const replay = request(f.app, 'POST', '/api/servers/1/music-requests/7/replay', { botId: 3 });
+      await started;
+      // What VoiceBot.stopAudio / clearPlayback do.
+      f.bot.stopGeneration++;
+      release();
+      const result = await replay;
+      assert.equal(result.status, 409, source);
+      assert.equal(f.bot.nowPlaying, null, source);
+      assert.equal(f.bot.queue.length, 0, source);
+      assert.deepEqual(f.played, [], source);
+      assert.deepEqual(f.recorded, [], source);
+    } finally {
+      release();
+      if (source === 'local') await rm(path.join(musicRoot, file), { force: true });
+    }
+  }
+});
+
+/** Replay a radio entry and run `change` while its history entry is still being read; the replay must queue nothing. */
+async function replayChangedDuringLookup(change: (f: ReturnType<typeof appFor>) => { queue: PlayQueue }) {
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = appFor({ rows: [{ id: 7, title: 'Radio', url: 'https://8.8.8.8/radio',
+    source: 'radio', status: 'available', serverConfigId: 1, musicBotId: 3 }],
+    findRequest: async () => { entered(); await gate; } });
+  try {
+    const replay = request(f.app, 'POST', '/api/servers/1/music-requests/7/replay', { botId: 3 });
+    await started;
+    const target = change(f);
+    release();
+    assert.equal((await replay).status, 409);
+    assert.deepEqual(f.played, []);
+    assert.equal(target.queue.length, 0);
+    assert.deepEqual(f.recorded, []);
+  } finally { release(); }
+}
+
+test('replay is dropped when Stop runs while the history entry is still being read', async () => {
+  await replayChangedDuringLookup(f => {
+    f.bot.stopGeneration++;
+    return f.bot;
+  });
+});
+
+test('replay is dropped when the bot is replaced while the history entry is still being read', async () => {
+  await replayChangedDuringLookup(f => {
+    // A restarted bot is a new instance whose generation starts again from 0.
+    const replacement = { ...f.bot, queue: new PlayQueue() };
+    f.app.locals.voiceBotManager.getBot = () => replacement;
+    return replacement;
+  });
+});
 
 test('replay on a full queue answers 409 and queues, downloads and plays nothing', async () => {
   const radio = [{ id: 7, title: 'Radio', url: 'https://8.8.8.8/radio', source: 'radio', status: 'available', serverConfigId: 1, musicBotId: 3 }];

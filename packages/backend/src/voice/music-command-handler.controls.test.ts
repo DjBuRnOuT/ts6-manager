@@ -19,7 +19,9 @@ function fixture(status = 'connected') {
       return { name: 'Rock', songs: [{ song: { id: 7, title: 'Track', filePath: '', source: 'youtube', sourceUrl: 'https://www.youtube.com/watch?v=abcdefghijk' } }] };
     },
   } } as any;
-  const handler = new MusicCommandHandler(prisma, {} as any) as any;
+  // The bot is looked up again after the playlist query; it is the one below.
+  const manager: any = { getBot: () => bot };
+  const handler = new MusicCommandHandler(prisma, manager) as any;
   handler.botChannelConfig.set(1, { serverConfigId: 9, virtualServerId: 1 });
   handler.reply = (_bot: unknown, _id: number, message: string) => replies.push(message);
   handler.saveMusicRequest = () => {};
@@ -193,6 +195,24 @@ test('!play <song name> reports no results and search failures without enqueuein
   await f.command('!play anything');
   assert.match(f.replies.at(-1)!, /Search failed: yt-dlp missing/);
   assert.equal(enqueued, 0);
+});
+
+test('a skip past the last track keeps pending requests; !stop and !stopstream cancel them', async () => {
+  const f = fixture('playing');
+  const stops: unknown[] = [];
+  const videoStops: unknown[][] = [];
+  Object.assign(f.bot, {
+    stopAudio(options?: unknown) { stops.push(options); },
+    videoStreaming: false,
+    async stopVideoStream(...args: unknown[]) { videoStops.push(args); },
+  });
+  await f.command('!skip');
+  assert.deepEqual(stops, [{ keepPendingRequests: true }]);
+  await f.command('!stop');
+  assert.deepEqual(stops.slice(1), [undefined]);
+  f.bot.videoStreaming = true;
+  await f.command('!stopstream');
+  assert.deepEqual(videoStops, [['manual', 'Stopped by chat command', { cancelPendingRequests: true }]]);
 });
 
 test('!stop during radio keeps the queued songs', async () => {
