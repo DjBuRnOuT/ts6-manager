@@ -131,17 +131,20 @@ async function fixture(role?: 'admin' | 'viewer' | 'operator', fullApp = false) 
     next();
   }, listenerRemoteAdminRoutes);
   const server = app.listen(0, '127.0.0.1');
+  const sockets: import('node:net').Socket[] = [];
+  server.on('connection', socket => sockets.push(socket));
   await once(server, 'listening');
   const address = server.address();
   assert.ok(address && typeof address === 'object');
   const base = `http://127.0.0.1:${address.port}/api`;
-  const request = (path: string, options: { method?: string; body?: unknown; rawBody?: string; session?: string; headers?: Record<string, string>; admin?: boolean } = {}) => fetch(`${base}/listener-remote${options.admin ? '-admin' : ''}${path}`, {
+  const request = (path: string, options: { method?: string; body?: unknown; rawBody?: string; session?: string; headers?: Record<string, string>; admin?: boolean; signal?: AbortSignal } = {}) => fetch(`${base}/listener-remote${options.admin ? '-admin' : ''}${path}`, {
     method: options.method ?? (options.body === undefined && options.rawBody === undefined ? 'GET' : 'POST'),
     headers: {
       ...(options.body === undefined && options.rawBody === undefined ? {} : { 'Content-Type': 'application/json' }),
       ...(options.session ? { Authorization: `Bearer ${options.session}` } : {}), ...options.headers,
     },
     body: options.rawBody ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
+    signal: options.signal,
   });
   const exchange = async () => {
     const issued = remote.issue(binding);
@@ -151,7 +154,7 @@ async function fixture(role?: 'admin' | 'viewer' | 'operator', fullApp = false) 
     return { ...data, token: issued.token };
   };
   return {
-    remote, request, exchange, queue, app, state, audit, songQueries, settingQueries, bot, history, plays,
+    remote, request, exchange, queue, app, state, audit, songQueries, settingQueries, bot, history, plays, sockets,
     get downloads() { return downloads; }, advance: (ms: number) => { now += ms; },
     close: () => new Promise<void>((resolve, reject) => {
       server.close(err => err ? reject(err) : resolve());
@@ -518,6 +521,137 @@ describe('listener remote HTTP security boundary', () => {
     assert.equal((await f.request('/requests', { session, body: { url: mediaUrl } })).status, 503);
     f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => item;
     assert.equal((await f.request('/requests', { session, body: { url: mediaUrl } })).status, 200);
+  }));
+
+  /** A download that never finishes on its own; like the real one, it stops and rejects when cancelled. */
+  function hangingDownload(f: Awaited<ReturnType<typeof fixture>>) {
+    const started = deferred<void>();
+    const cancelled = deferred<void>();
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = (_url: string, signal?: AbortSignal) => {
+      assert.ok(signal, 'the download receives the request signal');
+      started.resolve();
+      return new Promise<QueueItem>((_resolve, reject) => {
+        signal.addEventListener('abort', () => { cancelled.resolve(); reject(new Error('download stopped')); }, { once: true });
+      });
+    };
+    return { started: started.promise, cancelled: cancelled.promise };
+  }
+
+  it('cancels a link that outlives the deadline, answers 504 and frees its slot', async () => using(async f => {
+    f.app.locals.listenerLinkTimings = { deadlineMs: 50 };
+    const { session } = await f.exchange();
+    const download = hangingDownload(f);
+    const response = await f.request('/requests', { session, body: { url: mediaUrl } });
+    assert.equal(response.status, 504);
+    assert.deepEqual(await response.json(), { error: 'The media link took too long to load.', code: 'timeout' });
+    await download.cancelled;
+    assert.equal(f.queue.length, 1);
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => item;
+    assert.equal((await f.request('/requests', { session, body: { url: mediaUrl } })).status, 200);
+  }));
+
+  it('cancels a resolving link as soon as its session ends, without waiting for the download', async () => using(async f => {
+    f.app.locals.listenerLinkTimings = { sessionCheckMs: 10 };
+    const { session } = await f.exchange();
+    const download = hangingDownload(f);
+    const pending = f.request('/requests', { session, body: { url: mediaUrl } });
+    await download.started;
+    f.remote.revoke(binding.botId, binding.uid);
+    assert.equal((await pending).status, 401);
+    await download.cancelled;
+    assert.equal(f.queue.length, 1);
+    const next = await f.exchange();
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => item;
+    assert.equal((await f.request('/requests', { session: next.session, body: { url: mediaUrl } })).status, 200);
+  }));
+
+  it('cancels a resolving link when the client disconnects and frees its slot', async () => using(async f => {
+    const { session } = await f.exchange();
+    const download = hangingDownload(f);
+    const client = new AbortController();
+    const pending = f.request('/requests', { session, body: { url: mediaUrl }, signal: client.signal });
+    await download.started;
+    client.abort();
+    await assert.rejects(pending);
+    await download.cancelled;
+    assert.equal(f.queue.length, 1);
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => item;
+    assert.equal((await f.request('/requests', { session, body: { url: mediaUrl } })).status, 200);
+  }));
+
+  /**
+   * Hold a ServerQuery lookup of a link request (the first one, or the first after the
+   * download when `afterDownload`), disconnect the client, then release the lookup and
+   * wait for the abandoned request to end. Returns how many downloads ran.
+   */
+  async function disconnectDuringLookup(f: Awaited<ReturnType<typeof fixture>>, session: string, afterDownload: boolean) {
+    const bridge = f.app.locals.eventBridge as { executeCommand: (...args: any[]) => Promise<string> };
+    const executeCommand = bridge.executeCommand;
+    let downloads = 0;
+    const reached = deferred<void>();
+    const gate = deferred<void>();
+    bridge.executeCommand = async (...args) => {
+      if (!afterDownload || downloads > 0) { reached.resolve(); await gate.promise; }
+      return executeCommand(...args);
+    };
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => { downloads++; return item; };
+    const client = new AbortController();
+    const pending = f.request('/requests', { session, body: { url: mediaUrl }, signal: client.signal });
+    await reached.promise;
+    const socket = f.sockets.at(-1)!;
+    client.abort();
+    await assert.rejects(pending);
+    if (!socket.destroyed) await once(socket, 'close');
+    gate.resolve();
+    // The abandoned request ends with its audit attempt completed as a failure.
+    const failed = () => f.audit.some(row => { const outcome = (row.data as any)?.outcome; return outcome && outcome !== 'pending' && outcome !== 'success'; });
+    for (let turn = 0; turn < 500 && !failed(); turn++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(failed(), 'the abandoned request ended');
+    bridge.executeCommand = executeCommand;
+    return () => downloads;
+  }
+
+  it('does not queue a resolved link whose client left during the final access check', async () => using(async f => {
+    const { session } = await f.exchange();
+    const downloads = await disconnectDuringLookup(f, session, true);
+    assert.equal(downloads(), 1);
+    assert.equal(f.queue.length, 1);
+    assert.equal(f.plays.length, 0);
+  }));
+
+  it('lets a finished link through untouched by the deadline and session checks', async () => using(async f => {
+    f.app.locals.listenerLinkTimings = { deadlineMs: 5_000, sessionCheckMs: 10 };
+    const { session } = await f.exchange();
+    const release = deferred<QueueItem>();
+    const started = deferred<void>();
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = (_url: string, signal?: AbortSignal) => {
+      started.resolve();
+      return release.promise.then(value => { assert.equal(signal?.aborted, false); return value; });
+    };
+    const checked = deferred<void>();
+    let checks = 0;
+    const sessionRateKey = f.remote.sessionRateKey.bind(f.remote);
+    f.remote.sessionRateKey = (value) => {
+      if (++checks === 4) checked.resolve();
+      return sessionRateKey(value);
+    };
+    const pending = f.request('/requests', { session, body: { url: mediaUrl } });
+    await started.promise;
+    // The guard checks once on arrival; wait for three session checks while the download runs.
+    await checked.promise;
+    release.resolve(item);
+    assert.equal((await pending).status, 200);
+    assert.equal(f.queue.length, 2);
+  }));
+
+  it('cancels a link whose client left while its access was still being checked', async () => using(async f => {
+    const { session } = await f.exchange();
+    const downloads = await disconnectDuringLookup(f, session, false);
+    assert.equal(downloads(), 0);
+    assert.equal(f.queue.length, 1);
+    // Its slot is free for the next request.
+    assert.equal((await f.request('/requests', { session, body: { url: mediaUrl } })).status, 200);
+    assert.equal(downloads(), 1);
   }));
 });
 

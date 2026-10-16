@@ -248,8 +248,8 @@ function buildSpotifyFetchUrl(allowedHost: SpotifyFetchHost, from: URL): URL {
  * The request URL is rebuilt from an allowlisted host constant (not the raw user URL)
  * so redirects cannot pivot SSRF off an open redirect.
  */
-async function fetchSpotifyOgPage(initialUrl: URL, maxRedirects = 5): Promise<Response> {
-  return (await fetchSpotifyPage(initialUrl, maxRedirects)).response;
+async function fetchSpotifyOgPage(initialUrl: URL, maxRedirects = 5, signal?: AbortSignal): Promise<Response> {
+  return (await fetchSpotifyPage(initialUrl, maxRedirects, signal)).response;
 }
 
 /**
@@ -259,6 +259,7 @@ async function fetchSpotifyOgPage(initialUrl: URL, maxRedirects = 5): Promise<Re
 export async function fetchSpotifyPage(
   initialUrl: URL,
   maxRedirects = 5,
+  signal?: AbortSignal,
 ): Promise<{ response: Response; url: URL }> {
   let current = initialUrl;
 
@@ -279,7 +280,7 @@ export async function fetchSpotifyPage(
     const res = await fetch(safeUrl.href, {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; ts6-manager/1.0)" },
       redirect: "manual",
-      signal: AbortSignal.timeout(180_000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(180_000)]) : AbortSignal.timeout(180_000),
     });
 
     if (res.status >= 300 && res.status < 400) {
@@ -310,11 +311,33 @@ function withMediaUrl(args: string[], url: string): string[] {
   return [...args, "--", url];
 }
 
-/** Bound all downloader/playlist jobs, including listener requests without caller cancellation. */
+/** Longest one yt-dlp process may run. */
+const YT_DLP_TIMEOUT_MS = 180_000;
+
+/**
+ * Bound all downloader/playlist jobs, including listener requests without caller cancellation.
+ * On POSIX yt-dlp runs in its own process group, and a timeout or cancellation kills the whole
+ * group, so an ffmpeg it started for conversion stops with it instead of writing on afterwards.
+ */
 function runYtDlp(args: string[], onProgress?: (p: ProgressUpdate) => void, signal?: AbortSignal): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     signal?.throwIfAborted();
-    const proc = spawn(getYtDlpPath(), args, { shell: false, signal, timeout: 180_000, killSignal: "SIGKILL" });
+    // Own process group on POSIX; Windows has no process groups to kill, so it keeps the old behaviour.
+    const group = process.platform !== "win32";
+    const proc = spawn(getYtDlpPath(), args, { shell: false, detached: group });
+    let running = true;
+    const killTree = () => {
+      if (!running || proc.pid === undefined) return;
+      if (!group) { proc.kill("SIGKILL"); return; }
+      try { process.kill(-proc.pid, "SIGKILL"); } catch { proc.kill("SIGKILL"); }
+    };
+    const timer = setTimeout(killTree, YT_DLP_TIMEOUT_MS);
+    signal?.addEventListener("abort", killTree, { once: true });
+    const finished = () => {
+      running = false;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", killTree);
+    };
     let stdout = "";
     let stderr = "";
     const pending = { stdout: '', stderr: '' };
@@ -336,13 +359,20 @@ function runYtDlp(args: string[], onProgress?: (p: ProgressUpdate) => void, sign
       stderr = (stderr + chunk.toString()).slice(-65536);
       consumeProgress('stderr', chunk);
     });
-    proc.on("close", (code) => resolve({ code, stdout, stderr }));
-    proc.on("error", (err) => reject(signal?.aborted ? signal.reason : new Error(`yt-dlp not found: ${err.message}`)));
+    proc.on("close", (code) => {
+      finished();
+      if (signal?.aborted) reject(signal.reason);
+      else resolve({ code, stdout, stderr });
+    });
+    proc.on("error", (err) => {
+      finished();
+      reject(signal?.aborted ? signal.reason : new Error(`yt-dlp not found: ${err.message}`));
+    });
   });
 }
 
 /** Resolve Spotify track/album/playlist share links to a YouTube search query / best match URL. */
-export async function resolveSpotifyToYouTube(url: string): Promise<string> {
+export async function resolveSpotifyToYouTube(url: string, signal?: AbortSignal): Promise<string> {
   const cleaned = url.trim();
   let parsed: URL;
   try {
@@ -365,7 +395,7 @@ export async function resolveSpotifyToYouTube(url: string): Promise<string> {
   // Redirects are followed manually; each hop is rebuilt onto an allowlisted https host.
   let query = "";
   try {
-    const res = await fetchSpotifyOgPage(parsed);
+    const res = await fetchSpotifyOgPage(parsed, undefined, signal);
     query = spotifySearchQueryFromOg(await res.text());
   } catch {
     /* fall through */
@@ -375,7 +405,8 @@ export async function resolveSpotifyToYouTube(url: string): Promise<string> {
     query = decodeURIComponent(parsed.pathname.split("/").pop() || "").replace(/-/g, " ");
   }
 
-  const song = await findSongForQuery(query);
+  signal?.throwIfAborted();
+  const song = await findSongForQuery(query, undefined, signal);
   if (!song) throw new Error(`No YouTube match found for Spotify title: ${query}`);
   return song.url;
 }
@@ -622,6 +653,7 @@ export async function fetchYouTubeVideoMeta(
  */
 export async function getYouTubeUrlInfo(
   url: string,
+  signal?: AbortSignal,
 ): Promise<{ type: "video" | "playlist"; items: YouTubeSearchResult[]; title?: string }> {
   // Apple Music / Spotify must be resolved before yt-dlp — never pass them through.
   try {
@@ -664,7 +696,7 @@ export async function getYouTubeUrlInfo(
     "--dump-single-json",
     "--ignore-errors",
     "--no-download",
-  ], probeUrl));
+  ], probeUrl), undefined, signal);
 
   const stdout = result.stdout.trim();
   if (!stdout) {
@@ -796,6 +828,7 @@ export function mapYtDlpInfoJson(
 export async function expandYouTubeToWatchUrls(
   url: string,
   cap = 25,
+  signal?: AbortSignal,
 ): Promise<{
   type: "video" | "playlist";
   urls: string[];
@@ -810,7 +843,7 @@ export async function expandYouTubeToWatchUrls(
 
   if (isPlaylist) {
     try {
-      const info = await getYouTubeUrlInfo(url);
+      const info = await getYouTubeUrlInfo(url, signal);
       if (info.items.length > 0) {
         const items = info.items.slice(0, cap).map((item) => ({
           url: `https://www.youtube.com/watch?v=${item.id}`,
@@ -837,8 +870,9 @@ export async function expandYouTubeToWatchUrls(
   }
 
   // Last resort: probe again; never throw a raw TypeError from null JSON.
+  signal?.throwIfAborted();
   try {
-    const info = await getYouTubeUrlInfo(parsed.canonicalUrl);
+    const info = await getYouTubeUrlInfo(parsed.canonicalUrl, signal);
     if (info.items.length > 0) {
       return {
         type: info.type,
@@ -1005,8 +1039,8 @@ export async function findSongForQuery(
 }
 
 /** Best YouTube watch URL for an artist + title pair (Apple Music / Spotify tracks), or null. */
-export async function trackToYouTubeUrl(track: { artist?: string; title: string }): Promise<string | null> {
+export async function trackToYouTubeUrl(track: { artist?: string; title: string }, signal?: AbortSignal): Promise<string | null> {
   const query = [track.artist, track.title].filter(Boolean).join(" ").trim();
   if (!query) return null;
-  return (await findSongForQuery(query))?.url ?? null;
+  return (await findSongForQuery(query, undefined, signal))?.url ?? null;
 }
