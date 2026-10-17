@@ -102,6 +102,40 @@ Cloud metadata addresses stay blocked even when listed.
 - **Host-file overrides.** Media downloads resolve host names through DNS (`/etc/resolv.conf`), not `/etc/hosts`. Docker's DNS, systemd-resolved and Tailscale MagicDNS work as before.
 - **Emergency switch.** If downloads break because of the proxy, `MEDIA_EGRESS_PROXY=off` restores direct connections while you report the problem. It is not a supported way to run: only YouTube links and searches are accepted while it is off, and the Runtime / media check (Settings → YouTube, Media Library → Library) reports it as a failure.
 
+#### Downloads go into a separate cache folder
+
+Songs downloaded from links (YouTube, other sites, Spotify and Apple Music matches) are now stored in an app-owned folder, `.ts6-media-cache`, inside the music folder (`MUSIC_DIR`). Each download is checked before it is kept: it must be the one item that was requested, and audio whose length `ffprobe` can read (and that matches the announced length, when the site gives one). Downloads that fail the check are not kept, and the request fails with a message. There is no schema change and no Compose change.
+
+What changes, and what does not:
+
+- **Existing songs, playlists and queues keep working.** Their files stay where they are and are played as before. Nothing in the music folder outside `.ts6-media-cache` is renamed, moved, overwritten or deleted by the upgrade, the cache or its clean-up.
+- **Files from older downloads are not reused for new requests, and are not migrated.** They stay where they are and keep playing for the songs that use them. Asking again for something downloaded before 1.11.2 downloads it once more into the cache.
+
+  **Disk space.** Each such repeat keeps two copies until you archive the old one yourself. The worst case is about as much extra space as all your existing downloads. On top of that, the cache grows with every new source played or downloaded, because nothing in it is removed automatically.
+- **A link to a site other than YouTube is cached per exact link.** The same track pasted with a different link is downloaded separately.
+- **ffprobe is required for new downloads.** It ships with ffmpeg in the Docker images. On a native install without `ffprobe` on the backend's `PATH`, new downloads fail with *New downloads need ffprobe, which was not found…*; songs already in the library keep playing. The Runtime / media check shows whether ffprobe is available.
+- **A folder named `.ts6-media-cache` that TS6 Manager did not create** is left alone, and downloads fail with a message asking you to rename or move it. If the backend is stopped at the moment it creates the cache, an empty `.ts6-media-cache.<random>.tmp` folder can be left next to it; you can delete it.
+- **The cache holds the files of songs downloaded from now on.** Library songs, playlists and queues point into it, so do not delete or move `.ts6-media-cache`. Tracks that are played without being added to the library are kept there too, and the Library's **Scan** does not list them.
+- **The cache is not cleaned up automatically.** It grows with every new source played or downloaded; only leftovers of interrupted downloads are removed.
+- **Rolling back** to 1.11.1 is safe: older versions ignore the cache folder.
+
+**Back up before upgrading.** Stop the backend and copy both the database volume (`ts6webui.db` and any journal or WAL files) and the music folder.
+
+- Docker (split stack and all-in-one): the `backend-data` and `music-data` volumes.
+- Native install: the `data/` folder and `MUSIC_DIR`.
+
+Keep the backup until you have checked the upgrade.
+
+**Refreshing older downloads (optional, manual).** You do not need to do anything. If you want an older song re-downloaded and checked, the safe procedure is:
+
+1. Make the backup above.
+2. On the **Media Library → Library** page, download the song again from its original link. The page updates the existing entry in place to use the new, checked copy in the cache; do not remove it.
+3. Check that the entry plays.
+4. The old file stays in the music folder, now unused by that entry. Do not use **Remove** on the song to get rid of it: that deletes the song's current file. Before moving an old file away, make sure no other entry uses it; the same file can be shared by songs on several servers ([#478](https://github.com/uniskela/ts6-manager/issues/478)).
+5. Files in the music folder that no song uses are never touched by TS6 Manager. You can move them to an archive folder yourself.
+
+A tool that lists older downloads and refreshes them in bulk is planned for a later release.
+
 ## Pull and recreate
 
 For the split stack:
