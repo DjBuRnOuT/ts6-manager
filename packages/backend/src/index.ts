@@ -17,10 +17,11 @@ import type { JwtPayload } from '@ts6/common';
 import fs from 'fs';
 import path from 'path';
 import { startIptvAutoRefresh } from './iptv/iptv-scheduler.js';
-import { startAuditRetention } from './audit/index.js';
+import { ListenerRemoteRefusalAudit, startAuditRetention } from './audit/index.js';
 import { bootstrapLocalDevConnection } from './bootstrap/local-dev-connection.js';
 import { ActivityJournalService } from './activity-journal/activity-journal-service.js';
 import { startMediaEgress } from './voice/egress/media-egress.js';
+import { runInOrderWithin } from './utils/ordered-shutdown.js';
 
 async function main() {
   // C1: JWT secret startup guard
@@ -146,6 +147,10 @@ async function main() {
   const musicCommandHandler = new MusicCommandHandler(prisma, voiceBotManager);
   const listenerRemote = new ListenerRemoteService();
   app.locals.listenerRemote = listenerRemote;
+  // Bounded audit totals for refused listener remote requests.
+  const listenerRemoteRefusals = new ListenerRemoteRefusalAudit(prisma);
+  app.locals.listenerRemoteRefusals = listenerRemoteRefusals;
+  const stopListenerRemoteRefusals = listenerRemoteRefusals.start();
   app.locals.eventBridge = botEngine.getEventBridge();
   musicCommandHandler.setListenerRemote(listenerRemote);
   musicCommandHandler.setEventBridge(botEngine.getEventBridge());
@@ -182,8 +187,15 @@ async function main() {
     await botEngine.destroy();
     connectionPool.destroy();
     wss.close();
-    server.close();
-    await prisma.$disconnect();
+    // Stop taking requests, then write the last refusal totals before the database closes.
+    // Wait briefly for requests in flight; long-lived connections must not hold up shutdown.
+    const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+    server.closeIdleConnections();
+    await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref())]);
+    // Write the last refusal totals, then close the database, under one deadline: a stuck
+    // write must not hold up shutdown, and the database is never closed under a running write.
+    const done = await runInOrderWithin([stopListenerRemoteRefusals, () => prisma.$disconnect()], 5_000);
+    if (!done) console.warn('[TS6 WebUI] Shutdown: audit totals or the database did not finish within 5 s; exiting anyway');
     process.exit(0);
   };
 

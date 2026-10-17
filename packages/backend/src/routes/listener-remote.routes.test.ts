@@ -12,6 +12,7 @@ import { defaultMediaCommandPermissions } from '../voice/media-command-permissio
 import { PlayQueue, type QueueItem } from '../voice/playlist/queue.js';
 import { MediaSessionConflictError } from '../voice/media-session.js';
 import { createQueueChangeHook } from '../voice/queue-change-hook.js';
+import { ListenerRemoteRefusalAudit } from '../audit/listener-remote-refusals.js';
 
 const binding = { botId: 4, serverConfigId: 2, virtualServerId: 3, channelId: 8, clid: 9, uid: 'listener-secret-identity' };
 const mediaUrl = 'https://8.8.8.8/media?id=secret-request';
@@ -43,6 +44,8 @@ async function fixture(role?: 'admin' | 'viewer' | 'operator', fullApp = false) 
   const history: unknown[] = [];
   const plays: { item: QueueItem; options: unknown; stream: boolean }[] = [];
   const audit: Record<string, unknown>[] = [];
+  const refusalRows: Record<string, unknown>[] = [];
+  const refusalLog: string[] = [];
   const songQueries: unknown[] = [];
   const settingQueries: unknown[] = [];
   let downloads = 0;
@@ -114,9 +117,20 @@ async function fixture(role?: 'admin' | 'viewer' | 'operator', fullApp = false) 
         audit.push(data);
         return { id: 'audit-event' };
       },
-      updateMany: async (query: Record<string, unknown>) => { audit.push(query); return { count: 1 }; },
+      updateMany: async (query: Record<string, unknown>) => {
+        if ((query as any).data?.targetId?.startsWith?.('n=')) { refusalRows.push(query); return { count: 1 }; }
+        audit.push(query);
+        return { count: 1 };
+      },
+      createMany: async ({ data }: { data: Record<string, unknown>[] }) => {
+        if (state.failAudit) throw new Error('db-credential-must-not-leak');
+        refusalRows.push(...data);
+        return { count: data.length };
+      },
     },
   };
+  const refusals = new ListenerRemoteRefusalAudit(app.locals.prisma, { log: (m) => refusalLog.push(m) });
+  app.locals.listenerRemoteRefusals = refusals;
   app.locals.mediaUrlPipelineDeps = {
     resolveSpotify: async (url: string) => url,
     resolveAppleMusic: async () => ({ tracks: [] }),
@@ -154,6 +168,7 @@ async function fixture(role?: 'admin' | 'viewer' | 'operator', fullApp = false) 
     return { ...data, token: issued.token };
   };
   return {
+    refusalRows, refusalLog, flushRefusals: () => refusals.flush(),
     remote, request, exchange, queue, app, state, audit, songQueries, settingQueries, bot, history, plays, sockets,
     get downloads() { return downloads; }, advance: (ms: number) => { now += ms; },
     close: () => new Promise<void>((resolve, reject) => {
@@ -225,8 +240,9 @@ describe('listener remote HTTP security boundary', () => {
     f.queue.addMany(Array.from({ length: 499 }, (_, n) => track(1000 + n)));
     assert.equal(f.queue.upcomingCount, 500);
     const full = await f.request('/queue', { session, body: { songId: 11 } });
-    assert.equal(full.status, 429);
-    assert.deepEqual(await full.json(), { error: 'The queue is full.', code: 'rate_limited' });
+    assert.equal(full.status, 409);
+    assert.deepEqual(await full.json(), { error: 'The queue is full.', code: 'queue_full' });
+    assert.equal(full.headers.get('retry-after'), null, 'a full queue is not a rate limit');
     assert.equal(f.queue.upcomingCount, 500);
   }));
 
@@ -238,7 +254,7 @@ describe('listener remote HTTP security boundary', () => {
     assert.equal(f.queue.upcomingCount, 499);
     const responses = await Promise.all(Array.from({ length: 8 }, () => f.request('/queue', { session, body: { songId: 11 } })));
     const statuses = responses.map(response => response.status).sort((a, b) => a - b);
-    assert.deepEqual(statuses, [200, 429, 429, 429, 429, 429, 429, 429]);
+    assert.deepEqual(statuses, [200, 409, 409, 409, 409, 409, 409, 409]);
     assert.equal(f.queue.upcomingCount, 500);
   }));
 
@@ -262,7 +278,7 @@ describe('listener remote HTTP security boundary', () => {
       conflict();
     };
     const full = await f.request('/queue', { session, body: { songId: 11 } });
-    assert.equal(full.status, 429);
+    assert.equal(full.status, 409);
     assert.equal(f.queue.upcomingCount, 500);
   }));
 
@@ -275,7 +291,7 @@ describe('listener remote HTTP security boundary', () => {
     assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 200);
     assert.equal(f.queue.length, 5000);
     const full = await f.request('/queue', { session, body: { songId: 11 } });
-    assert.equal(full.status, 429);
+    assert.equal(full.status, 409);
     assert.equal(f.queue.length, 5000);
   }));
 
@@ -299,13 +315,141 @@ describe('listener remote HTTP security boundary', () => {
     assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 403);
   }));
 
+  it('records refused access as one bounded total per source and window, without the address', async () => using(async f => {
+    const unknown = 'A'.repeat(43);
+    for (let i = 0; i < 3; i++) assert.equal((await f.request('/state', { session: unknown })).status, 401);
+    assert.equal((await f.request('/exchange', { body: { token: 'B'.repeat(43) } })).status, 401);
+    assert.deepEqual(f.refusalRows, [], 'nothing is written per request');
+    await f.flushRefusals();
+    const rows = f.refusalRows.map((row: any) => ({ action: row.action, actor: row.actorUsername, target: row.targetId, result: row.resultCode }));
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every(row => row.action === 'listener.remote.auth_failed' && row.result === 'invalid_access'));
+    assert.deepEqual(rows.map(row => row.target).sort(), ['n=1;exchange', 'n=3;state']);
+    assert.ok(rows.every(row => /^address:[0-9a-f]{64}$/.test(row.actor)), 'only a hash of the address is kept');
+    assert.ok(!JSON.stringify(f.refusalRows).includes('127.0.0.1'));
+  }));
+
+  it('records a permission denial at once with its listener, bot and command, and totals repeats, before any audit attempt', async () => using(async f => {
+    const { session } = await f.exchange();
+    restrict(f, [8]);
+    for (let i = 0; i < 3; i++) assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 403);
+    assert.equal(f.songQueries.length, 0, 'no song lookup for a denied listener');
+    assert.deepEqual(f.audit, [], 'a denied request opens no audit attempt');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.refusalRows.length, 1);
+    const first = f.refusalRows[0] as any;
+    assert.equal(first.action, 'listener.remote.denied');
+    assert.equal(first.resultCode, 'permission_denied');
+    assert.equal(first.actorUsername, `listener:${createHash('sha256').update(binding.uid).digest('hex')}`);
+    assert.equal(first.connectionId, binding.serverConfigId);
+    assert.equal(first.targetId, `n=1;bot=${binding.botId};add`);
+    await f.flushRefusals();
+    assert.deepEqual((f.refusalRows[1] as any).data.targetId, `n=3;bot=${binding.botId};add`);
+  }));
+
+  it('refuses a full queue before any audit attempt and totals it', async () => using(async f => {
+    const { session } = await f.exchange();
+    for (let i = 0; i < 500; i++) f.queue.add({ ...item, id: `filler-${i}` });
+    for (let i = 0; i < 2; i++) assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 409);
+    assert.deepEqual(f.audit, []);
+    await f.flushRefusals();
+    const rows = f.refusalRows.map((row: any) => row.action ?? row.data?.targetId);
+    assert.deepEqual(rows, ['listener.remote.capacity', `n=2;bot=${binding.botId};queue`]);
+    assert.equal((f.refusalRows[0] as any).resultCode, 'queue_full');
+  }));
+
+  it('labels a refusal inside an opened attempt with its own result code', async () => using(async f => {
+    const { session } = await f.exchange();
+    const started = deferred<void>();
+    const gate = deferred<void>();
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => { started.resolve(); await gate.promise; return item; };
+    const pending = f.request('/requests', { session, body: { url: mediaUrl } });
+    await started.promise;
+    restrict(f, [8]);
+    gate.resolve();
+    assert.equal((await pending).status, 403);
+    const completion = f.audit.find((row: any) => row.where?.operationId) as any;
+    assert.equal(completion.data.resultCode, 'permission_denied');
+    await f.flushRefusals();
+    assert.deepEqual(f.refusalRows, [], 'counted once, on the attempt row');
+  }));
+
+  it('still refuses when the refusal totals cannot be written', async () => using(async f => {
+    const { session } = await f.exchange();
+    f.state.failAudit = true;
+    restrict(f, [8]);
+    assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 403);
+    assert.equal((await f.request('/state', { session: 'C'.repeat(43) })).status, 401);
+    await f.flushRefusals();
+    assert.equal(f.queue.length, 1);
+    assert.ok(f.refusalLog.some(line => line.includes('Could not write')));
+    assert.ok(f.refusalLog.every(line => !line.includes('credential')), 'no storage error text reaches the log');
+  }));
+
+  it('refuses plainly disallowed links before any TeamSpeak lookup or audit work', async () => using(async f => {
+    const { session } = await f.exchange();
+    const bridge = f.app.locals.eventBridge as { executeCommand: (...args: any[]) => Promise<string> };
+    const executeCommand = bridge.executeCommand;
+    let commands = 0;
+    bridge.executeCommand = async (...args) => { commands++; return executeCommand(...args); };
+    for (const url of ['http://127.0.0.1/a', 'http://localhost/a', 'http://10.0.0.1/a', 'http://169.254.169.254/a', 'http://[::1]/a']) {
+      assert.equal((await f.request('/requests', { session, body: { url } })).status, 400, url);
+    }
+    assert.equal(commands, 0);
+    assert.deepEqual(f.audit, []);
+    bridge.executeCommand = executeCommand;
+  }));
+
+  it('refuses a second pending link before opening an audit attempt for it', async () => using(async f => {
+    const { session } = await f.exchange();
+    const started = deferred<void>();
+    const gate = deferred<void>();
+    f.app.locals.mediaUrlPipelineDeps.downloadTrack = async () => { started.resolve(); await gate.promise; return item; };
+    const first = f.request('/requests', { session, body: { url: mediaUrl } });
+    await started.promise;
+    const opened = f.audit.length;
+    assert.equal((await f.request('/requests', { session, body: { url: `${mediaUrl}&second` } })).status, 429);
+    assert.equal(f.audit.length, opened, 'no attempt row for the refused link');
+    gate.resolve();
+    assert.equal((await first).status, 200);
+    await f.flushRefusals();
+    const row = f.refusalRows.find((r: any) => r.action === 'listener.remote.rate_limited') as any;
+    assert.equal(row?.targetId, `n=1;bot=${binding.botId};requests`);
+  }));
+
+  it('counts a request that failed before its audit attempt existed', async () => using(async f => {
+    const { session } = await f.exchange();
+    f.state.failAudit = true;
+    assert.equal((await f.request('/queue', { session, body: { songId: 11 } })).status, 503);
+    const refusals = f.app.locals.listenerRemoteRefusals as { unavailable: number };
+    assert.equal(refusals.unavailable, 1, 'a failed attempt insert is counted, not hidden');
+  }));
+
+  it('checks access again once the audit attempt is written, before any media work', async () => using(async f => {
+    const { session } = await f.exchange();
+    const prisma = f.app.locals.prisma as any;
+    const create = prisma.adminAuditEvent.create;
+    const writing = deferred<void>();
+    const gate = deferred<void>();
+    prisma.adminAuditEvent.create = async (args: unknown) => { writing.resolve(); await gate.promise; return create(args); };
+    const pending = f.request('/requests', { session, body: { url: mediaUrl } });
+    await writing.promise;
+    restrict(f, [8]);
+    gate.resolve();
+    assert.equal((await pending).status, 403);
+    assert.equal(f.downloads, 0, 'no download after access was withdrawn');
+  }));
+
   it('scopes song lookup to the bound server and refuses missing or foreign songs', async () => using(async f => {
     const { session } = await f.exchange();
     f.state.missingSong = true;
     assert.equal((await f.request('/queue', { session, body: { songId: 22 } })).status, 404);
     assert.deepEqual(f.songQueries, [{ where: { id: 22, serverConfigId: 2 } }]);
     assert.equal(f.queue.length, 1);
-    assert.ok(f.audit.some(row => (row.data as any)?.outcome === 'failure'));
+    // A routine refusal is counted, not written to the audit log.
+    assert.deepEqual(f.audit, []);
+    await f.flushRefusals();
+    assert.deepEqual(f.refusalRows, []);
   }));
 
   it('revokes access on live channel departure, identity reuse, bot movement or scope change', async () => {
@@ -342,6 +486,14 @@ describe('listener remote HTTP security boundary', () => {
     }, role);
   });
 
+  it('does not count administrator route errors as listener refusals', async () => using(async f => {
+    assert.equal((await f.request('/bots/not-a-number/revoke', { admin: true, method: 'POST', body: {} })).status, 400);
+    const refusals = f.app.locals.listenerRemoteRefusals as { validation: number; unavailable: number };
+    assert.equal(refusals.validation + refusals.unavailable, 0);
+    await f.flushRefusals();
+    assert.deepEqual(f.refusalRows, []);
+  }, 'admin'));
+
   it('allows audited admin revocation of one listener and all listeners of a bot', async () => using(async f => {
     const first = await f.exchange();
     const otherBinding = { ...binding, uid: 'other-listener', clid: 10 };
@@ -367,7 +519,7 @@ describe('listener remote HTTP security boundary', () => {
       assert.equal((await f.request('/requests', { session, body: { url } })).status, 400, url);
       assert.equal(f.downloads, 0);
       assert.equal(f.queue.length, 1);
-      assert.ok(f.audit.some(row => (row.data as any)?.outcome === 'failure'));
+      assert.deepEqual(f.audit, [], 'a disallowed link opens no audit attempt');
     });
   });
 
@@ -603,10 +755,15 @@ describe('listener remote HTTP security boundary', () => {
     await assert.rejects(pending);
     if (!socket.destroyed) await once(socket, 'close');
     gate.resolve();
-    // The abandoned request ends with its audit attempt completed as a failure.
-    const failed = () => f.audit.some(row => { const outcome = (row.data as any)?.outcome; return outcome && outcome !== 'pending' && outcome !== 'success'; });
+    // The abandoned request ends: after the download its audit attempt is completed as a
+    // failure; before it, no attempt was opened and it is only counted.
+    const refusals = f.app.locals.listenerRemoteRefusals as { unavailable: number };
+    const failed = () => afterDownload
+      ? f.audit.some(row => { const outcome = (row.data as any)?.outcome; return outcome && outcome !== 'pending' && outcome !== 'success'; })
+      : refusals.unavailable > 0;
     for (let turn = 0; turn < 500 && !failed(); turn++) await new Promise(resolve => setImmediate(resolve));
     assert.ok(failed(), 'the abandoned request ended');
+    if (!afterDownload) assert.deepEqual(f.audit, [], 'no audit attempt for a request abandoned during its checks');
     bridge.executeCommand = executeCommand;
     return () => downloads;
   }

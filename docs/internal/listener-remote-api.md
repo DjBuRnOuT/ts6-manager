@@ -73,6 +73,21 @@ Pasted URLs use the existing SSRF validator without the admin LAN allowlist,
 followed by the normal media URL pipeline. URLs containing userinfo are
 rejected.
 
+Order of checks for `/queue` and `/requests` (cheapest first): body schema and,
+for links, URL syntax plus blocked hosts and private or reserved literals (no
+I/O) → authentication → authorization (`add`) → queue room → the request's own
+check (song lookup; for links: link-request limit, a free resolving slot, the
+destination's DNS check) → audit attempt opened → authorization again →
+resolve → authorization again → stop check and queue room again → queue. A
+link request uses up one of the session's link requests even when the bot's
+resolving slot is taken. One 120-second deadline, the
+session checks and the client-disconnect check cover a link from its slot
+reservation to the end of its download. Refusals before the attempt are kept
+in `ListenerRemoteRefusalAudit` (bounded per-window totals; 401, 403, 429 and
+409 `queue_full`), routine 400/404 and unavailable or timed-out 503/504 refusals are
+only counted in the log, and refusals after the attempt is opened complete that
+attempt with a specific result code.
+
 ## Administrative revocation
 
 `POST /api/listener-remote-admin/bots/:botId/revoke`, with the normal admin
@@ -87,7 +102,8 @@ Errors are `{error: string, code: string}` with static, credential-free text.
 Codes: `invalid_request` (400), `invalid_access` (401; missing, consumed,
 expired, revoked or departed access), `permission_denied` (403), `not_found`
 (404; song/bot), `cancelled` (409; stopped or cleared while resolving),
-`rate_limited` (429), `unavailable` (503), `timeout` (504; a pasted link took
+`queue_full` (409; the bot's queue has no room), `rate_limited` (429),
+`unavailable` (503), `timeout` (504; a pasted link took
 longer than two minutes to load). The remote surface never returns resolver,
 Query, database or credential-bearing exception text.
 
@@ -144,8 +160,16 @@ limiters and the sign-in limiter use bounded stores with the same policy; the
 sign-in store holds 100,000 entries.
 
 A 429 from a rate limit carries `Retry-After` with the whole seconds left in
-that window (at least 1). A full queue or a pending link resolution answers 429
-with `Retry-After: 60`.
+that window (at least 1). A pending link resolution answers 429 with
+`Retry-After: 60`. A full queue is not a rate limit: it answers 409
+`queue_full`, with no `Retry-After`.
+
+**Change in 1.11.2:** a full queue answered 429 `rate_limited` with
+`Retry-After: 60` before. Clients that waited and retried on that 429 should
+treat 409 `queue_full` as "no room now" and let the listener try again later;
+it is not retried automatically. The bundled listener page already shows the
+message and keeps the session. A second pending link is still 429
+`rate_limited`.
 URL resolution permits one pending job per bot and four across the remote
 service. A pasted link has two minutes, including the URL check, to resolve
 and download; the work is cancelled when that deadline passes (504 `timeout`),

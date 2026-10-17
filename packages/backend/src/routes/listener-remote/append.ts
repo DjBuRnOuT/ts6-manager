@@ -14,12 +14,12 @@ const MAX_QUEUE_ITEMS = 5000;
 
 export type ListenerAppendAction = 'listener.remote.queue_add' | 'listener.remote.request';
 
-/** Fail with 429 when a listener request would grow the bot's queue past its limits. */
+/** Fail with 409 `queue_full` when a listener request would grow the bot's queue past its limits. */
 export function assertQueueRoom(bot: { queue: Pick<PlayQueue, 'upcomingCount' | 'length'> }): void {
   // Count what is still to play: tracks already played stay in the queue and must not use up the limit.
   // The total is capped separately so listener requests cannot grow one queue without bound.
   if (bot.queue.upcomingCount >= MAX_UPCOMING_TRACKS || bot.queue.length >= MAX_QUEUE_ITEMS) {
-    fail(429, 'rate_limited', 'The queue is full.');
+    fail(409, 'queue_full', 'The queue is full.');
   }
 }
 
@@ -52,22 +52,33 @@ function assertNotStopped(bot: ListenerBot, arrival: ArrivalSnapshot): void {
 }
 
 /**
- * Audit, authorize, resolve and queue one listener item. Authorization runs
- * again after `resolveItem`, because resolving can take long enough for the
- * listener to leave or be revoked, or for someone to press Stop.
+ * Authorize, audit, resolve and queue one listener item.
+ *
+ * The cheap refusals come first and are counted in the bounded refusal totals
+ * rather than audited one by one: permission (403), a full queue (409) and
+ * the request's own `precheck` (a missing song, a disallowed link, the link
+ * limit). Only a request that is about to do real work opens an audit attempt.
+ * Authorization runs again after `resolveItem`, because resolving can take long
+ * enough for the listener to leave or be revoked, or for someone to press Stop.
  */
 export async function appendForListener(
   req: Request, binding: ListenerRemoteBinding, resolveItem: () => Promise<QueueItem>, action: ListenerAppendAction,
-  arrival: ArrivalSnapshot = arrivalSnapshot(req),
+  arrival: ArrivalSnapshot = arrivalSnapshot(req), precheck?: () => Promise<void>,
 ) {
+  const first = await authorized(req, 'add', 'request');
+  // A bot that was briefly unavailable on arrival but serves the listener now
+  // has not been stopped; compare against it from here on.
+  if (!arrival.bot && first.bot) arrival = { bot: first.bot, stopGeneration: first.bot.stopGeneration };
+  assertQueueRoom(first.bot);
+  await precheck?.();
   await runRemoteAudited(req.app.locals.prisma, {
     actor: listenerActor(binding), action, connectionId: binding.serverConfigId,
     virtualServerId: binding.virtualServerId, target: { type: 'music_bot', id: binding.botId },
   }, async () => {
-    const first = await authorized(req, 'add', 'request');
-    // A bot that was briefly unavailable on arrival but serves the listener now
-    // has not been stopped; compare against it from here on.
-    if (!arrival.bot && first.bot) arrival = { bot: first.bot, stopGeneration: first.bot.stopGeneration };
+    // The attempt row exists from here, so a refusal is recorded on it, not in the refusal totals.
+    if (req.res) req.res.locals.listenerRemoteAttemptOpened = true;
+    // Writing the attempt can take a while; check access again before any media work.
+    await authorized(req, 'add', 'request');
     const item = await resolveItem();
     const { bot } = await authorized(req, 'add', 'request');
     // A listener who left while the request was being checked does not get it queued.
