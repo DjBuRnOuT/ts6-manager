@@ -592,21 +592,29 @@ function queuedSongFiles(manager: VoiceBotManager | undefined): string[] {
   return files;
 }
 
+/** A route id written as a plain positive whole number ("12", not "1e1", "0x0c" or "12abc"); otherwise null. */
+function positiveId(raw: unknown): number | null {
+  if (typeof raw !== 'string' || !/^[1-9]\d*$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
 // DELETE /songs/:id — Delete song
 musicLibraryRoutes.delete('/songs/:id', musicWriteLimiter, async (req: Request, res: Response, next) => {
   try {
     const prisma = req.app.locals.prisma;
-    const id = parseInt(req.params.id as string);
-    const song = await prisma.song.findUnique({ where: { id } });
+    const configId = positiveId(req.params.configId);
+    const id = positiveId(req.params.id);
+    // Only songs of the server in the URL: another server's song is "not found" and nothing is removed.
+    const scope = { id, serverConfigId: configId };
+    const song = id !== null && configId !== null
+      ? await prisma.song.findFirst({ where: scope })
+      : null;
     if (!song) throw new AppError(404, 'Song not found');
 
-    try {
-      await prisma.song.delete({ where: { id } });
-    } catch (err) {
-      // Removed by a concurrent request in the meantime.
-      if ((err as { code?: unknown }).code === 'P2025') throw new AppError(404, 'Song not found');
-      throw err;
-    }
+    const { count } = await prisma.song.deleteMany({ where: scope });
+    // Removed by a concurrent request in the meantime.
+    if (count === 0) throw new AppError(404, 'Song not found');
     // The file goes too, unless something else still uses it (see removeSongFileIfUnused).
     try {
       const outcome = await removeSongFileIfUnused({
